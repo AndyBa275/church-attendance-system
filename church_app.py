@@ -54,9 +54,12 @@ def get_sheet_data(tab_name):
         
         spreadsheet = client.open_by_key(SPREADSHEET_ID)
         worksheet = spreadsheet.worksheet(tab_name)
-        data = worksheet.get_all_records()
         
-        if not data:
+        # Get all values including headers
+        all_values = worksheet.get_all_values()
+        
+        # Check if sheet has data (more than just headers)
+        if not all_values or len(all_values) <= 1:
             # Return empty dataframe with expected columns
             if tab_name == MEMBERS_TAB:
                 return pd.DataFrame(columns=['Member_Name', 'Home_Cell_Group', 'Phone', 'Email', 'Gender', 
@@ -71,10 +74,31 @@ def get_sheet_data(tab_name):
                 return pd.DataFrame(columns=['Username', 'Password', 'Role', 'Home_Cell_Group'])
             elif tab_name == ANNOUNCEMENTS_TAB:
                 return pd.DataFrame(columns=['Date', 'Title', 'Message', 'Posted_By', 'Timestamp'])
+            return pd.DataFrame()
+        
+        # Get data as records (skips header row)
+        data = worksheet.get_all_records()
+        
+        if not data:
+            # Return empty dataframe with headers from sheet
+            return pd.DataFrame(columns=all_values[0])
         
         return pd.DataFrame(data)
     except Exception as e:
-        st.error(f"Error reading from {tab_name}: {str(e)}")
+        # Return empty dataframe on error instead of showing error
+        if tab_name == MEMBERS_TAB:
+            return pd.DataFrame(columns=['Member_Name', 'Home_Cell_Group', 'Phone', 'Email', 'Gender', 
+                                        'Date of Birth', 'Marital Status', 'Member Type', 'City'])
+        elif tab_name == ATTENDANCE_TAB:
+            return pd.DataFrame(columns=['Date', 'Home_Cell_Group', 'Member_Name', 'Present', 
+                                        'Recorded_By', 'Timestamp'])
+        elif tab_name == OFFERINGS_TAB:
+            return pd.DataFrame(columns=['Date', 'Amount_GHS', 'Meeting_Type', 'Description', 
+                                        'Entered_By', 'Timestamp'])
+        elif tab_name == USERS_TAB:
+            return pd.DataFrame(columns=['Username', 'Password', 'Role', 'Home_Cell_Group'])
+        elif tab_name == ANNOUNCEMENTS_TAB:
+            return pd.DataFrame(columns=['Date', 'Title', 'Message', 'Posted_By', 'Timestamp'])
         return pd.DataFrame()
 
 def write_sheet_data(tab_name, df):
@@ -196,6 +220,7 @@ def attendance_page():
     # Check role
     if st.session_state.role not in ['Home Cell Leader', 'Admin']:
         st.warning("You don't have permission to mark attendance.")
+        st.info(f"💡 Your current role is: '{st.session_state.role}' - it should be 'Admin' or 'Home Cell Leader'")
         return
     
     # Select date
