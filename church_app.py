@@ -161,32 +161,25 @@ def verify_login(username, password):
             return True, user.iloc[0]['Role'], user.iloc[0]['Home_Cell_Group']
     return False, None, None
 
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def get_cached_members_master():
+    """Get Members Master sheet - cached to avoid repeated slow fetches"""
+    return get_sheet_data(MEMBERS_TAB)
+
 def get_home_cell_groups():
     """Get unique home cell groups from members"""
-    members_df = get_sheet_data(MEMBERS_TAB)
+    members_df = get_cached_members_master()
     if not members_df.empty and 'Home_Cell_Group' in members_df.columns:
         return sorted(members_df['Home_Cell_Group'].dropna().unique().tolist())
     return []
 
 def get_members_by_cell(home_cell):
     """Get members for a specific home cell - with caching"""
-    cache_key = f"members_{home_cell}"
-    
-    # Check if already in session state (cache)
-    if cache_key in st.session_state:
-        return st.session_state[cache_key]
-    
-    # Fetch from Google Sheets
-    members_df = get_sheet_data(MEMBERS_TAB)
+    members_df = get_cached_members_master()
     if not members_df.empty and 'Home_Cell_Group' in members_df.columns:
         cell_members = members_df[members_df['Home_Cell_Group'] == home_cell]
         if 'Member_Name' in cell_members.columns:
-            result = cell_members[['Member_Name', 'Phone', 'Home_Cell_Group']].dropna(subset=['Member_Name'])
-            # Cache in session state
-            st.session_state[cache_key] = result
-            return result
-    
-    # Return empty dataframe if nothing found
+            return cell_members[['Member_Name', 'Phone', 'Home_Cell_Group']].dropna(subset=['Member_Name'])
     return pd.DataFrame()
 
 # Page Functions
@@ -256,10 +249,8 @@ def attendance_page():
             pass
         with col_refresh:
             if st.button("🔄 Refresh Members", help="Reload members from Google Sheets"):
-                # Clear cache for this cell
-                cache_key = f"members_{selected_cell}"
-                if cache_key in st.session_state:
-                    del st.session_state[cache_key]
+                # Clear the cache
+                st.cache_data.clear()
                 st.rerun()
         
         # Get members
@@ -348,7 +339,7 @@ def attendance_page():
                 st.write(f"**Selected Cell:** `{selected_cell}`")
                 
                 # Try to fetch again and show what we get
-                all_members = get_sheet_data(MEMBERS_TAB)
+                all_members = get_cached_members_master()
                 
                 if all_members.empty:
                     st.error("❌ Cannot read Members Master sheet from Google Sheets!")
@@ -371,10 +362,7 @@ def attendance_page():
                         st.write("Available columns:", list(all_members.columns))
                 
                 if st.button("Clear Cache & Retry", key="debug_retry"):
-                    # Clear all member caches
-                    keys_to_delete = [k for k in st.session_state.keys() if k.startswith('members_')]
-                    for key in keys_to_delete:
-                        del st.session_state[key]
+                    st.cache_data.clear()
                     st.rerun()
 
 def offerings_page():
@@ -453,7 +441,7 @@ def search_members_page():
     search_term = st.text_input("Search by Name", placeholder="Enter member name...")
     
     if search_term:
-        members_df = get_sheet_data(MEMBERS_TAB)
+        members_df = get_cached_members_master()
         
         if not members_df.empty:
             # Search in Member_Name column
@@ -486,7 +474,7 @@ def search_members_page():
             st.error("Could not load members data")
     else:
         # Show summary
-        members_df = get_sheet_data(MEMBERS_TAB)
+        members_df = get_cached_members_master()
         if not members_df.empty:
             st.info(f"Total Members: {len(members_df)}")
             
@@ -761,7 +749,7 @@ def admin_page():
     with tab3:
         st.subheader("System Information")
         
-        members_df = get_sheet_data(MEMBERS_TAB)
+        members_df = get_cached_members_master()
         if not members_df.empty:
             st.metric("Total Members", len(members_df))
         
@@ -774,6 +762,13 @@ def admin_page():
         
         st.divider()
         st.info("💾 **Data Storage:** All data is stored in Google Sheets and persists permanently!")
+        
+        # Add cache clear button
+        if st.button("🔄 Clear All Cache", help="Clear cached data and reload from Google Sheets"):
+            st.cache_data.clear()
+            st.success("Cache cleared! Page will reload.")
+            time.sleep(1)
+            st.rerun()
 
 # Main App
 def main():
