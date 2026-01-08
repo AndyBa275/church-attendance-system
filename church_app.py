@@ -1,24 +1,21 @@
 import streamlit as st
 import pandas as pd
-import gspread
-from google.oauth2.service_account import Credentials
+import os
 from datetime import datetime, date
 import time
-import json
+from pathlib import Path
+import threading
 
-# Google Sheets Configuration
-SPREADSHEET_ID = "1xj89TMBgyBnEByNQD6jluLGBt07AuPwFCEq0u0H1bO8"
-SCOPES = [
-    'https://www.googleapis.com/auth/spreadsheets',
-    'https://www.googleapis.com/auth/drive'
-]
+# File paths - works both locally and on Streamlit Cloud
+BASE_PATH = os.path.dirname(os.path.abspath(__file__))
+MEMBERS_FILE = os.path.join(BASE_PATH, "Members.xlsx")
+ATTENDANCE_FILE = os.path.join(BASE_PATH, "Attendance.xlsx")
+OFFERINGS_FILE = os.path.join(BASE_PATH, "Offerings.xlsx")
+USERS_FILE = os.path.join(BASE_PATH, "Users.xlsx")
+ANNOUNCEMENTS_FILE = os.path.join(BASE_PATH, "Announcements.xlsx")
 
-# Sheet names
-MEMBERS_SHEET = "Members Master"
-ATTENDANCE_SHEET = "Church Attendance"
-OFFERINGS_SHEET = "Church Offerings"
-USERS_SHEET = "Church Users"
-ANNOUNCEMENTS_SHEET = "Church Announcements"
+# File lock
+file_lock = threading.Lock()
 
 # Initialize session state
 if 'logged_in' not in st.session_state:
@@ -27,143 +24,74 @@ if 'logged_in' not in st.session_state:
     st.session_state.role = None
     st.session_state.home_cell = None
 
-# Google Sheets Helper Functions
-@st.cache_resource
-def get_google_sheets_client():
-    """Initialize Google Sheets client with credentials"""
-    try:
-        # Try to get credentials from Streamlit secrets (for deployment)
-        creds_dict = st.secrets["gcp_service_account"]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-    except:
-        # Fall back to credentials.json file (for local development)
-        try:
-            creds = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
-        except FileNotFoundError:
-            st.error("❌ credentials.json not found! Please ensure it's in the same folder as this script.")
-            st.stop()
+# Helper Functions
+def safe_read_excel(file_path):
+    """Safely read Excel file with lock"""
+    with file_lock:
+        if os.path.exists(file_path):
+            return pd.read_excel(file_path)
+        return None
+
+def safe_write_excel(df, file_path):
+    """Safely write to Excel file with lock"""
+    with file_lock:
+        df.to_excel(file_path, index=False)
+        time.sleep(0.1)  # Small delay to ensure file is written
+
+def initialize_files():
+    """Create necessary files if they don't exist"""
     
-    client = gspread.authorize(creds)
-    return client
-
-def get_sheet(sheet_name):
-    """Get a specific sheet from the spreadsheet"""
-    try:
-        client = get_google_sheets_client()
-        spreadsheet = client.open_by_key(SPREADSHEET_ID)
-        worksheet = spreadsheet.worksheet(sheet_name)
-        return worksheet
-    except Exception as e:
-        st.error(f"Error accessing sheet '{sheet_name}': {str(e)}")
-        return None
-
-def read_sheet_as_dataframe(sheet_name):
-    """Read a Google Sheet and return as pandas DataFrame"""
-    try:
-        worksheet = get_sheet(sheet_name)
-        if worksheet:
-            data = worksheet.get_all_records()
-            if data:
-                return pd.DataFrame(data)
-            else:
-                # Return empty DataFrame with headers
-                headers = worksheet.row_values(1)
-                return pd.DataFrame(columns=headers)
-        return None
-    except Exception as e:
-        st.error(f"Error reading sheet '{sheet_name}': {str(e)}")
-        return None
-
-def write_dataframe_to_sheet(df, sheet_name):
-    """Write pandas DataFrame to Google Sheet"""
-    try:
-        worksheet = get_sheet(sheet_name)
-        if worksheet:
-            # Clear existing data
-            worksheet.clear()
-            
-            # Write headers and data
-            worksheet.update([df.columns.values.tolist()] + df.values.tolist())
-            return True
-        return False
-    except Exception as e:
-        st.error(f"Error writing to sheet '{sheet_name}': {str(e)}")
-        return False
-
-def append_to_sheet(data_dict, sheet_name):
-    """Append a single row to a Google Sheet"""
-    try:
-        worksheet = get_sheet(sheet_name)
-        if worksheet:
-            # Get headers
-            headers = worksheet.row_values(1)
-            
-            # Create row in correct order
-            row = [data_dict.get(header, '') for header in headers]
-            
-            # Append row
-            worksheet.append_row(row)
-            return True
-        return False
-    except Exception as e:
-        st.error(f"Error appending to sheet '{sheet_name}': {str(e)}")
-        return False
-
-def initialize_sheets():
-    """Initialize all required sheets if they don't exist"""
-    try:
-        client = get_google_sheets_client()
-        spreadsheet = client.open_by_key(SPREADSHEET_ID)
-        
-        # Get existing sheet names
-        existing_sheets = [ws.title for ws in spreadsheet.worksheets()]
-        
-        # Define required sheets and their headers
-        required_sheets = {
-            ATTENDANCE_SHEET: ['Date', 'Home_Cell_Group', 'Member_Name', 'Present', 'Recorded_By', 'Timestamp'],
-            OFFERINGS_SHEET: ['Date', 'Amount_GHS', 'Meeting_Type', 'Description', 'Entered_By', 'Timestamp'],
-            USERS_SHEET: ['Username', 'Password', 'Role', 'Home_Cell_Group'],
-            ANNOUNCEMENTS_SHEET: ['Date', 'Title', 'Message', 'Posted_By', 'Timestamp']
-        }
-        
-        # Create missing sheets
-        for sheet_name, headers in required_sheets.items():
-            if sheet_name not in existing_sheets:
-                worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=len(headers))
-                worksheet.update([headers])
-                
-                # Initialize Users sheet with default data
-                if sheet_name == USERS_SHEET:
-                    default_users = [
-                        ['admin', 'admin123', 'Admin', 'All'],
-                        ['accountant', 'account123', 'Accountant', 'N/A']
-                    ]
-                    worksheet.append_rows(default_users)
-        
-        return True
-    except Exception as e:
-        st.error(f"Error initializing sheets: {str(e)}")
-        return False
+    # Create Attendance file if doesn't exist
+    if not os.path.exists(ATTENDANCE_FILE):
+        attendance_df = pd.DataFrame(columns=[
+            'Date', 'Home_Cell_Group', 'Member_Name', 'Present', 'Recorded_By', 'Timestamp'
+        ])
+        safe_write_excel(attendance_df, ATTENDANCE_FILE)
+    
+    # Create Offerings file if doesn't exist
+    if not os.path.exists(OFFERINGS_FILE):
+        offerings_df = pd.DataFrame(columns=[
+            'Date', 'Amount_GHS', 'Meeting_Type', 'Description', 'Entered_By', 'Timestamp'
+        ])
+        safe_write_excel(offerings_df, OFFERINGS_FILE)
+    
+    # Create Users file if doesn't exist
+    if not os.path.exists(USERS_FILE):
+        users_df = pd.DataFrame({
+            'Username': ['admin', 'accountant'],
+            'Password': ['admin123', 'account123'],
+            'Role': ['Admin', 'Accountant'],
+            'Home_Cell_Group': ['All', 'N/A']
+        })
+        safe_write_excel(users_df, USERS_FILE)
+    
+    # Create Announcements file if doesn't exist
+    if not os.path.exists(ANNOUNCEMENTS_FILE):
+        announcements_df = pd.DataFrame(columns=[
+            'Date', 'Title', 'Message', 'Posted_By', 'Timestamp'
+        ])
+        safe_write_excel(announcements_df, ANNOUNCEMENTS_FILE)
 
 def verify_login(username, password):
     """Verify user credentials"""
-    users_df = read_sheet_as_dataframe(USERS_SHEET)
-    if users_df is not None and not users_df.empty:
+    users_df = safe_read_excel(USERS_FILE)
+    if users_df is not None:
         user = users_df[(users_df['Username'] == username) & (users_df['Password'] == password)]
         if not user.empty:
             return True, user.iloc[0]['Role'], user.iloc[0]['Home_Cell_Group']
     return False, None, None
 
 def get_home_cell_groups():
-    """Get unique home cell groups from members sheet"""
-    members_df = read_sheet_as_dataframe(MEMBERS_SHEET)
+    """Get unique home cell groups from members file"""
+    members_df = safe_read_excel(MEMBERS_FILE)
     if members_df is not None and 'Home_Cell_Group' in members_df.columns:
+        # Get last Home_Cell_Group column (there seem to be duplicates in headers)
         return sorted(members_df['Home_Cell_Group'].dropna().unique().tolist())
     return []
 
 def get_members_by_cell(home_cell):
     """Get members for a specific home cell"""
-    members_df = read_sheet_as_dataframe(MEMBERS_SHEET)
+    members_df = safe_read_excel(MEMBERS_FILE)
     if members_df is not None and 'Home_Cell_Group' in members_df.columns:
         cell_members = members_df[members_df['Home_Cell_Group'] == home_cell]
         return cell_members[['Member_Name', 'Phone', 'Home_Cell_Group']].dropna(subset=['Member_Name'])
@@ -190,10 +118,15 @@ def login_page():
                     st.session_state.role = role
                     st.session_state.home_cell = home_cell
                     st.success(f"Welcome {username}!")
-                    time.sleep(1)
                     st.rerun()
                 else:
                     st.error("❌ Invalid username or password")
+                    # Debug info for troubleshooting
+                    with st.expander("🔍 Debug Info (Admin Only)"):
+                        users_df = safe_read_excel(USERS_FILE)
+                        if users_df is not None:
+                            st.write("Available usernames:", users_df['Username'].tolist())
+                            st.caption("Check spelling and case sensitivity")
             else:
                 st.warning("Please enter both username and password")
         
@@ -215,9 +148,6 @@ def attendance_page():
     # Get home cell
     if st.session_state.role == 'Admin':
         home_cells = get_home_cell_groups()
-        if not home_cells:
-            st.warning("No home cell groups found. Please check Members Master sheet.")
-            return
         selected_cell = st.selectbox("Select Home Cell Group", home_cells)
     else:
         selected_cell = st.session_state.home_cell
@@ -232,9 +162,9 @@ def attendance_page():
             st.write(f"Total Members: {len(members)}")
             
             # Check if attendance already marked for this date and cell
-            attendance_df = read_sheet_as_dataframe(ATTENDANCE_SHEET)
+            attendance_df = safe_read_excel(ATTENDANCE_FILE)
             existing_attendance = None
-            if attendance_df is not None and not attendance_df.empty:
+            if attendance_df is not None:
                 existing_attendance = attendance_df[
                     (attendance_df['Date'] == str(attendance_date)) & 
                     (attendance_df['Home_Cell_Group'] == selected_cell)
@@ -253,6 +183,7 @@ def attendance_page():
                     if not member_record.empty:
                         default_value = member_record.iloc[0]['Present'] == 'Yes'
                 
+                # Use unique key with index to handle duplicate names
                 unique_key = f"attendance_{selected_cell}_{idx}_{member_name}"
                 attendance_dict[member_name] = st.checkbox(
                     f"{member_name}", 
@@ -266,45 +197,44 @@ def attendance_page():
             
             with col2:
                 if st.button("💾 Submit Attendance", use_container_width=True, type="primary"):
-                    with st.spinner("Saving attendance..."):
-                        # Read existing attendance
-                        attendance_df = read_sheet_as_dataframe(ATTENDANCE_SHEET)
-                        
-                        # Remove existing records for this date and cell
-                        if attendance_df is not None and not attendance_df.empty:
-                            attendance_df = attendance_df[
-                                ~((attendance_df['Date'] == str(attendance_date)) & 
-                                  (attendance_df['Home_Cell_Group'] == selected_cell))
-                            ]
-                        else:
-                            attendance_df = pd.DataFrame(columns=['Date', 'Home_Cell_Group', 'Member_Name', 'Present', 'Recorded_By', 'Timestamp'])
-                        
-                        # Add new records
-                        new_records = []
-                        for member_name, present in attendance_dict.items():
-                            new_records.append({
-                                'Date': str(attendance_date),
-                                'Home_Cell_Group': selected_cell,
-                                'Member_Name': member_name,
-                                'Present': 'Yes' if present else 'No',
-                                'Recorded_By': st.session_state.username,
-                                'Timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            })
-                        
-                        new_df = pd.DataFrame(new_records)
-                        attendance_df = pd.concat([attendance_df, new_df], ignore_index=True)
-                        
-                        # Save to Google Sheets
-                        if write_dataframe_to_sheet(attendance_df, ATTENDANCE_SHEET):
-                            present_count = sum(attendance_dict.values())
-                            st.success(f"✅ Attendance saved! {present_count}/{len(members)} members present")
-                            time.sleep(1)
-                            st.rerun()
-                        else:
-                            st.error("Failed to save attendance. Please try again.")
+                    # Prepare attendance records
+                    new_records = []
+                    for member_name, present in attendance_dict.items():
+                        new_records.append({
+                            'Date': str(attendance_date),
+                            'Home_Cell_Group': selected_cell,
+                            'Member_Name': member_name,
+                            'Present': 'Yes' if present else 'No',
+                            'Recorded_By': st.session_state.username,
+                            'Timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        })
+                    
+                    # Read existing attendance
+                    attendance_df = safe_read_excel(ATTENDANCE_FILE)
+                    
+                    # Remove existing records for this date and cell (to update)
+                    if attendance_df is not None:
+                        attendance_df = attendance_df[
+                            ~((attendance_df['Date'] == str(attendance_date)) & 
+                              (attendance_df['Home_Cell_Group'] == selected_cell))
+                        ]
+                    else:
+                        attendance_df = pd.DataFrame()
+                    
+                    # Append new records
+                    new_df = pd.DataFrame(new_records)
+                    attendance_df = pd.concat([attendance_df, new_df], ignore_index=True)
+                    
+                    # Save
+                    safe_write_excel(attendance_df, ATTENDANCE_FILE)
+                    
+                    present_count = sum(attendance_dict.values())
+                    st.success(f"✅ Attendance saved! {present_count}/{len(members)} members present")
+                    time.sleep(1)
+                    st.rerun()
         else:
             st.warning(f"No members found in {selected_cell}")
-
+    
 def offerings_page():
     """Offerings entry page"""
     st.title("💰 Offerings & Tithes")
@@ -335,22 +265,27 @@ def offerings_page():
     
     if st.button("💾 Save Offering", type="primary"):
         if amount > 0:
-            with st.spinner("Saving offering..."):
-                new_record = {
-                    'Date': str(offering_date),
-                    'Amount_GHS': amount,
-                    'Meeting_Type': meeting_type,
-                    'Description': description,
-                    'Entered_By': st.session_state.username,
-                    'Timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-                
-                if append_to_sheet(new_record, OFFERINGS_SHEET):
-                    st.success(f"✅ Offering of GHS {amount:.2f} recorded!")
-                    time.sleep(1)
-                    st.rerun()
-                else:
-                    st.error("Failed to save offering. Please try again.")
+            offerings_df = safe_read_excel(OFFERINGS_FILE)
+            
+            new_record = {
+                'Date': str(offering_date),
+                'Amount_GHS': amount,
+                'Meeting_Type': meeting_type,
+                'Description': description,
+                'Entered_By': st.session_state.username,
+                'Timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            new_df = pd.DataFrame([new_record])
+            if offerings_df is not None:
+                offerings_df = pd.concat([offerings_df, new_df], ignore_index=True)
+            else:
+                offerings_df = new_df
+            
+            safe_write_excel(offerings_df, OFFERINGS_FILE)
+            st.success(f"✅ Offering of GHS {amount:.2f} recorded!")
+            time.sleep(1)
+            st.rerun()
         else:
             st.warning("Please enter an amount greater than 0")
     
@@ -358,7 +293,7 @@ def offerings_page():
     st.divider()
     st.subheader("Recent Offerings")
     
-    offerings_df = read_sheet_as_dataframe(OFFERINGS_SHEET)
+    offerings_df = safe_read_excel(OFFERINGS_FILE)
     if offerings_df is not None and not offerings_df.empty:
         recent = offerings_df.sort_values('Timestamp', ascending=False).head(10)
         st.dataframe(recent[['Date', 'Amount_GHS', 'Meeting_Type', 'Description', 'Entered_By']], 
@@ -377,9 +312,9 @@ def search_members_page():
     search_term = st.text_input("Search by Name", placeholder="Enter member name...")
     
     if search_term:
-        members_df = read_sheet_as_dataframe(MEMBERS_SHEET)
+        members_df = safe_read_excel(MEMBERS_FILE)
         
-        if members_df is not None and not members_df.empty:
+        if members_df is not None:
             # Search in Member_Name column
             results = members_df[members_df['Member_Name'].str.contains(search_term, case=False, na=False)]
             
@@ -401,6 +336,7 @@ def search_members_page():
                             st.write(f"**Email:** {row.get('Email', 'N/A')}")
                             st.write(f"**Member Type:** {row.get('Member Type', 'N/A')}")
                             st.write(f"**City:** {row.get('City', 'N/A')}")
+                            # Handle date of birth with trailing space
                             dob = row.get('Date of Birth ', row.get('Date of Birth', 'N/A'))
                             st.write(f"**Date of Birth:** {dob}")
             else:
@@ -409,8 +345,8 @@ def search_members_page():
             st.error("Could not load members data")
     else:
         # Show summary
-        members_df = read_sheet_as_dataframe(MEMBERS_SHEET)
-        if members_df is not None and not members_df.empty:
+        members_df = safe_read_excel(MEMBERS_FILE)
+        if members_df is not None:
             st.info(f"Total Members: {len(members_df)}")
             
             # Group by home cell
@@ -431,27 +367,32 @@ def announcements_page():
             
             if st.button("Post Announcement"):
                 if title and message:
-                    with st.spinner("Posting announcement..."):
-                        new_announcement = {
-                            'Date': str(date.today()),
-                            'Title': title,
-                            'Message': message,
-                            'Posted_By': st.session_state.username,
-                            'Timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        }
-                        
-                        if append_to_sheet(new_announcement, ANNOUNCEMENTS_SHEET):
-                            st.success("✅ Announcement posted!")
-                            time.sleep(1)
-                            st.rerun()
-                        else:
-                            st.error("Failed to post announcement. Please try again.")
+                    announcements_df = safe_read_excel(ANNOUNCEMENTS_FILE)
+                    
+                    new_announcement = {
+                        'Date': str(date.today()),
+                        'Title': title,
+                        'Message': message,
+                        'Posted_By': st.session_state.username,
+                        'Timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                    
+                    new_df = pd.DataFrame([new_announcement])
+                    if announcements_df is not None:
+                        announcements_df = pd.concat([announcements_df, new_df], ignore_index=True)
+                    else:
+                        announcements_df = new_df
+                    
+                    safe_write_excel(announcements_df, ANNOUNCEMENTS_FILE)
+                    st.success("✅ Announcement posted!")
+                    time.sleep(1)
+                    st.rerun()
                 else:
                     st.warning("Please fill in both title and message")
     
     # Display announcements
     st.subheader("Recent Announcements")
-    announcements_df = read_sheet_as_dataframe(ANNOUNCEMENTS_SHEET)
+    announcements_df = safe_read_excel(ANNOUNCEMENTS_FILE)
     
     if announcements_df is not None and not announcements_df.empty:
         announcements_df = announcements_df.sort_values('Timestamp', ascending=False)
@@ -488,28 +429,26 @@ def admin_page():
             
             if new_role == "Home Cell Leader":
                 home_cells = get_home_cell_groups()
-                if home_cells:
-                    new_home_cell = st.selectbox("Home Cell Group", home_cells)
-                else:
-                    st.warning("No home cell groups found in Members Master sheet")
-                    new_home_cell = None
+                new_home_cell = st.selectbox("Home Cell Group", home_cells)
             else:
                 new_home_cell = "N/A"
         
         if st.button("Add User", type="primary"):
-            if new_username and new_password and (new_role != "Home Cell Leader" or new_home_cell):
-                users_df = read_sheet_as_dataframe(USERS_SHEET)
+            if new_username and new_password:
+                users_df = safe_read_excel(USERS_FILE)
                 
                 # Check if username exists
                 if new_username in users_df['Username'].values:
                     st.error("❌ Username already exists!")
+                # Check if home cell leader already exists for this cell
                 elif new_role == "Home Cell Leader":
                     existing_leader = users_df[
                         (users_df['Role'] == 'Home Cell Leader') & 
                         (users_df['Home_Cell_Group'] == new_home_cell)
                     ]
                     if not existing_leader.empty:
-                        st.error(f"❌ A Home Cell Leader already exists for {new_home_cell}")
+                        st.error(f"❌ A Home Cell Leader already exists for {new_home_cell}: {existing_leader.iloc[0]['Username']}")
+                        st.info("💡 You can edit the existing user below or choose a different home cell.")
                     else:
                         new_user = {
                             'Username': new_username,
@@ -518,10 +457,11 @@ def admin_page():
                             'Home_Cell_Group': new_home_cell
                         }
                         
-                        if append_to_sheet(new_user, USERS_SHEET):
-                            st.success(f"✅ User {new_username} added!")
-                            time.sleep(1)
-                            st.rerun()
+                        users_df = pd.concat([users_df, pd.DataFrame([new_user])], ignore_index=True)
+                        safe_write_excel(users_df, USERS_FILE)
+                        st.success(f"✅ User {new_username} added!")
+                        time.sleep(1)
+                        st.rerun()
                 else:
                     new_user = {
                         'Username': new_username,
@@ -530,17 +470,112 @@ def admin_page():
                         'Home_Cell_Group': new_home_cell
                     }
                     
-                    if append_to_sheet(new_user, USERS_SHEET):
-                        st.success(f"✅ User {new_username} added!")
-                        time.sleep(1)
-                        st.rerun()
+                    users_df = pd.concat([users_df, pd.DataFrame([new_user])], ignore_index=True)
+                    safe_write_excel(users_df, USERS_FILE)
+                    st.success(f"✅ User {new_username} added!")
+                    time.sleep(1)
+                    st.rerun()
             else:
-                st.warning("Please fill in all required fields")
+                st.warning("Please fill in all fields")
         
         st.divider()
-        st.subheader("👥 Existing Users")
-        users_df = read_sheet_as_dataframe(USERS_SHEET)
+        st.subheader("👥 Manage Existing Users")
+        users_df = safe_read_excel(USERS_FILE)
         if users_df is not None and not users_df.empty:
+            
+            # Select user to edit
+            edit_username = st.selectbox(
+                "Select User to Edit/Delete", 
+                users_df['Username'].tolist(),
+                key="edit_user_select"
+            )
+            
+            if edit_username:
+                user_data = users_df[users_df['Username'] == edit_username].iloc[0]
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.info(f"**Editing:** {edit_username}")
+                    new_pass = st.text_input("New Password (leave blank to keep current)", type="password", key="edit_pass")
+                    
+                    edit_role = st.selectbox(
+                        "Role", 
+                        ["Home Cell Leader", "Accountant", "Admin"],
+                        index=["Home Cell Leader", "Accountant", "Admin"].index(user_data['Role']) if user_data['Role'] in ["Home Cell Leader", "Accountant", "Admin"] else 0,
+                        key="edit_role"
+                    )
+                
+                with col2:
+                    st.write("")  # Spacing
+                    st.write("")
+                    if edit_role == "Home Cell Leader":
+                        home_cells = get_home_cell_groups()
+                        current_cell_idx = home_cells.index(user_data['Home_Cell_Group']) if user_data['Home_Cell_Group'] in home_cells else 0
+                        edit_home_cell = st.selectbox(
+                            "Home Cell Group", 
+                            home_cells,
+                            index=current_cell_idx,
+                            key="edit_home_cell"
+                        )
+                    else:
+                        edit_home_cell = "N/A"
+                
+                col_update, col_delete = st.columns(2)
+                
+                with col_update:
+                    if st.button("💾 Update User", use_container_width=True, type="primary"):
+                        # Check for duplicate home cell leader (if changing to different cell)
+                        if edit_role == "Home Cell Leader" and edit_home_cell != user_data['Home_Cell_Group']:
+                            existing_leader = users_df[
+                                (users_df['Role'] == 'Home Cell Leader') & 
+                                (users_df['Home_Cell_Group'] == edit_home_cell) &
+                                (users_df['Username'] != edit_username)
+                            ]
+                            if not existing_leader.empty:
+                                st.error(f"❌ A Home Cell Leader already exists for {edit_home_cell}")
+                            else:
+                                # Update user
+                                users_df.loc[users_df['Username'] == edit_username, 'Role'] = edit_role
+                                users_df.loc[users_df['Username'] == edit_username, 'Home_Cell_Group'] = edit_home_cell
+                                if new_pass:
+                                    users_df.loc[users_df['Username'] == edit_username, 'Password'] = new_pass
+                                
+                                safe_write_excel(users_df, USERS_FILE)
+                                st.success(f"✅ User {edit_username} updated!")
+                                time.sleep(1)
+                                st.rerun()
+                        else:
+                            # Update user
+                            users_df.loc[users_df['Username'] == edit_username, 'Role'] = edit_role
+                            users_df.loc[users_df['Username'] == edit_username, 'Home_Cell_Group'] = edit_home_cell
+                            if new_pass:
+                                users_df.loc[users_df['Username'] == edit_username, 'Password'] = new_pass
+                            
+                            safe_write_excel(users_df, USERS_FILE)
+                            st.success(f"✅ User {edit_username} updated!")
+                            time.sleep(1)
+                            st.rerun()
+                
+                with col_delete:
+                    if st.button("🗑️ Delete User", use_container_width=True, type="secondary"):
+                        if edit_username == "admin":
+                            st.error("❌ Cannot delete admin account!")
+                        else:
+                            # Confirm deletion
+                            if st.session_state.get('confirm_delete') != edit_username:
+                                st.session_state.confirm_delete = edit_username
+                                st.warning("⚠️ Click again to confirm deletion")
+                            else:
+                                users_df = users_df[users_df['Username'] != edit_username]
+                                safe_write_excel(users_df, USERS_FILE)
+                                st.session_state.confirm_delete = None
+                                st.success(f"✅ User {edit_username} deleted!")
+                                time.sleep(1)
+                                st.rerun()
+            
+            st.divider()
+            st.subheader("All Users")
             # Don't show passwords
             display_df = users_df[['Username', 'Role', 'Home_Cell_Group']]
             st.dataframe(display_df, use_container_width=True, hide_index=True)
@@ -548,7 +583,8 @@ def admin_page():
     with tab2:
         st.subheader("Attendance Reports")
         
-        attendance_df = read_sheet_as_dataframe(ATTENDANCE_SHEET)
+        # Overall statistics
+        attendance_df = safe_read_excel(ATTENDANCE_FILE)
         if attendance_df is not None and not attendance_df.empty:
             col1, col2, col3 = st.columns(3)
             
@@ -565,12 +601,13 @@ def admin_page():
                     attendance_rate = (present_count / total_records) * 100
                     st.metric("Attendance Rate", f"{attendance_rate:.1f}%")
             
+            # Recent attendance by cell
             st.subheader("Recent Attendance by Home Cell")
-            recent_dates = sorted(attendance_df['Date'].unique(), reverse=True)[:4]
+            recent_dates = attendance_df['Date'].unique()[-4:]  # Last 4 dates
             
-            for date_val in recent_dates:
-                with st.expander(f"📅 {date_val}"):
-                    date_data = attendance_df[attendance_df['Date'] == date_val]
+            for date in sorted(recent_dates, reverse=True):
+                with st.expander(f"📅 {date}"):
+                    date_data = attendance_df[attendance_df['Date'] == date]
                     cell_summary = date_data.groupby('Home_Cell_Group')['Present'].apply(
                         lambda x: f"{(x == 'Yes').sum()}/{len(x)}"
                     )
@@ -581,17 +618,16 @@ def admin_page():
     with tab3:
         st.subheader("System Information")
         
-        members_df = read_sheet_as_dataframe(MEMBERS_SHEET)
+        members_df = safe_read_excel(MEMBERS_FILE)
         if members_df is not None:
             st.metric("Total Members", len(members_df))
         
         home_cells = get_home_cell_groups()
         st.metric("Total Home Cell Groups", len(home_cells))
         
-        if home_cells:
-            st.write("**Home Cell Groups:**")
-            for cell in home_cells:
-                st.write(f"- {cell}")
+        st.write("**Home Cell Groups:**")
+        for cell in home_cells:
+            st.write(f"- {cell}")
 
 # Main App
 def main():
@@ -601,9 +637,8 @@ def main():
         layout="wide"
     )
     
-    # Initialize sheets
-    with st.spinner("Connecting to Google Sheets..."):
-        initialize_sheets()
+    # Initialize files
+    initialize_files()
     
     # Check if logged in
     if not st.session_state.logged_in:
