@@ -169,12 +169,24 @@ def get_home_cell_groups():
     return []
 
 def get_members_by_cell(home_cell):
-    """Get members for a specific home cell"""
+    """Get members for a specific home cell - with caching"""
+    cache_key = f"members_{home_cell}"
+    
+    # Check if already in session state (cache)
+    if cache_key in st.session_state:
+        return st.session_state[cache_key]
+    
+    # Fetch from Google Sheets
     members_df = get_sheet_data(MEMBERS_TAB)
     if not members_df.empty and 'Home_Cell_Group' in members_df.columns:
         cell_members = members_df[members_df['Home_Cell_Group'] == home_cell]
         if 'Member_Name' in cell_members.columns:
-            return cell_members[['Member_Name', 'Phone', 'Home_Cell_Group']].dropna(subset=['Member_Name'])
+            result = cell_members[['Member_Name', 'Phone', 'Home_Cell_Group']].dropna(subset=['Member_Name'])
+            # Cache in session state
+            st.session_state[cache_key] = result
+            return result
+    
+    # Return empty dataframe if nothing found
     return pd.DataFrame()
 
 # Page Functions
@@ -238,6 +250,18 @@ def attendance_page():
         st.info(f"Your Home Cell: **{selected_cell}**")
     
     if selected_cell:
+        # Add refresh button for members
+        col_title, col_refresh = st.columns([3, 1])
+        with col_title:
+            pass
+        with col_refresh:
+            if st.button("🔄 Refresh Members", help="Reload members from Google Sheets"):
+                # Clear cache for this cell
+                cache_key = f"members_{selected_cell}"
+                if cache_key in st.session_state:
+                    del st.session_state[cache_key]
+                st.rerun()
+        
         # Get members
         members = get_members_by_cell(selected_cell)
         
@@ -318,6 +342,40 @@ def attendance_page():
                             st.error("❌ Failed to save attendance. Please try again.")
         else:
             st.warning(f"No members found in {selected_cell}")
+            
+            # Debug information
+            with st.expander("🔍 Debug Info - Why are members not showing?"):
+                st.write(f"**Selected Cell:** `{selected_cell}`")
+                
+                # Try to fetch again and show what we get
+                all_members = get_sheet_data(MEMBERS_TAB)
+                
+                if all_members.empty:
+                    st.error("❌ Cannot read Members Master sheet from Google Sheets!")
+                    st.info("Check that the 'Members Master' tab exists and has data.")
+                else:
+                    st.success(f"✅ Members Master sheet loaded: {len(all_members)} total members")
+                    
+                    if 'Home_Cell_Group' in all_members.columns:
+                        unique_cells = all_members['Home_Cell_Group'].unique()
+                        st.write(f"**Available Home Cell Groups:** {list(unique_cells)}")
+                        
+                        # Check for close matches
+                        exact_match = all_members[all_members['Home_Cell_Group'] == selected_cell]
+                        st.write(f"**Exact matches for '{selected_cell}':** {len(exact_match)}")
+                        
+                        if len(exact_match) == 0:
+                            st.warning("⚠️ No exact matches found. Check spelling in Google Sheet!")
+                    else:
+                        st.error("❌ 'Home_Cell_Group' column not found in Members Master sheet!")
+                        st.write("Available columns:", list(all_members.columns))
+                
+                if st.button("Clear Cache & Retry", key="debug_retry"):
+                    # Clear all member caches
+                    keys_to_delete = [k for k in st.session_state.keys() if k.startswith('members_')]
+                    for key in keys_to_delete:
+                        del st.session_state[key]
+                    st.rerun()
 
 def offerings_page():
     """Offerings entry page"""
