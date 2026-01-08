@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import os
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import time
 import gspread
 from google.oauth2.service_account import Credentials
@@ -17,6 +17,8 @@ OFFERINGS_TAB = "Church Offerings"
 USERS_TAB = "Church Users"
 ANNOUNCEMENTS_TAB = "Church Announcements"
 MEMBERS_TAB = "Members Master"
+WELFARE_TAB = "Welfare Records"
+ATTENDANCE_SUMMARY_TAB = "Attendance Summary"
 
 # Initialize session state
 if 'logged_in' not in st.session_state:
@@ -74,6 +76,12 @@ def get_sheet_data(tab_name):
                 return pd.DataFrame(columns=['Username', 'Password', 'Role', 'Home_Cell_Group'])
             elif tab_name == ANNOUNCEMENTS_TAB:
                 return pd.DataFrame(columns=['Date', 'Title', 'Message', 'Posted_By', 'Timestamp'])
+            elif tab_name == WELFARE_TAB:
+                return pd.DataFrame(columns=['Date', 'Member_Name', 'Home_Cell_Group', 'Amount_GHS', 
+                                            'Collected_By', 'Timestamp'])
+            elif tab_name == ATTENDANCE_SUMMARY_TAB:
+                return pd.DataFrame(columns=['Member_Name', 'Home_Cell_Group', 'Last_3_Attendances', 
+                                            'Missed_Count', 'Status', 'Last_Updated'])
             return pd.DataFrame()
         
         # Get data as records (skips header row)
@@ -99,6 +107,12 @@ def get_sheet_data(tab_name):
             return pd.DataFrame(columns=['Username', 'Password', 'Role', 'Home_Cell_Group'])
         elif tab_name == ANNOUNCEMENTS_TAB:
             return pd.DataFrame(columns=['Date', 'Title', 'Message', 'Posted_By', 'Timestamp'])
+        elif tab_name == WELFARE_TAB:
+            return pd.DataFrame(columns=['Date', 'Member_Name', 'Home_Cell_Group', 'Amount_GHS', 
+                                        'Collected_By', 'Timestamp'])
+        elif tab_name == ATTENDANCE_SUMMARY_TAB:
+            return pd.DataFrame(columns=['Member_Name', 'Home_Cell_Group', 'Last_3_Attendances', 
+                                        'Missed_Count', 'Status', 'Last_Updated'])
         return pd.DataFrame()
 
 def write_sheet_data(tab_name, df):
@@ -181,6 +195,81 @@ def get_members_by_cell(home_cell):
         if 'Member_Name' in cell_members.columns:
             return cell_members[['Member_Name', 'Phone', 'Home_Cell_Group']].dropna(subset=['Member_Name'])
     return pd.DataFrame()
+
+def update_attendance_summary():
+    """Update the attendance summary with members at risk"""
+    try:
+        # Get attendance records
+        attendance_df = get_sheet_data(ATTENDANCE_TAB)
+        members_df = get_cached_members_master()
+        
+        if attendance_df.empty or members_df.empty:
+            return False
+        
+        # Get unique dates (last 3 church services)
+        if 'Date' in attendance_df.columns:
+            unique_dates = sorted(attendance_df['Date'].unique(), reverse=True)[:3]
+            
+            if len(unique_dates) < 3:
+                # Not enough data yet
+                return False
+            
+            summary_records = []
+            
+            # Process each member
+            for _, member in members_df.iterrows():
+                member_name = member['Member_Name']
+                home_cell = member['Home_Cell_Group']
+                
+                # Get member's last 3 attendance records
+                member_attendance = attendance_df[
+                    (attendance_df['Member_Name'] == member_name) & 
+                    (attendance_df['Date'].isin(unique_dates))
+                ]
+                
+                # Count attendance
+                attendance_status = []
+                missed_count = 0
+                
+                for date_val in unique_dates:
+                    date_record = member_attendance[member_attendance['Date'] == date_val]
+                    if not date_record.empty:
+                        status = date_record.iloc[0]['Present']
+                        attendance_status.append(status)
+                        if status == 'No':
+                            missed_count += 1
+                    else:
+                        # No record = assumed absent
+                        attendance_status.append('No')
+                        missed_count += 1
+                
+                # Determine risk status
+                if missed_count >= 2:
+                    status = "⚠️ DANGER - Contact Member"
+                    
+                    summary_records.append({
+                        'Member_Name': member_name,
+                        'Home_Cell_Group': home_cell,
+                        'Last_3_Attendances': ' | '.join(attendance_status),
+                        'Missed_Count': missed_count,
+                        'Status': status,
+                        'Last_Updated': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+            
+            # Create summary dataframe (only members at risk)
+            if summary_records:
+                summary_df = pd.DataFrame(summary_records)
+                return write_sheet_data(ATTENDANCE_SUMMARY_TAB, summary_df)
+            else:
+                # No members at risk - clear the sheet but keep headers
+                empty_df = pd.DataFrame(columns=['Member_Name', 'Home_Cell_Group', 'Last_3_Attendances', 
+                                                'Missed_Count', 'Status', 'Last_Updated'])
+                return write_sheet_data(ATTENDANCE_SUMMARY_TAB, empty_df)
+        
+        return False
+    except Exception as e:
+        st.error(f"Error updating attendance summary: {str(e)}")
+        return False
 
 # Page Functions
 def login_page():
@@ -325,6 +414,9 @@ def attendance_page():
                         
                         # Save to Google Sheets
                         if write_sheet_data(ATTENDANCE_TAB, attendance_df):
+                            # Update attendance summary
+                            update_attendance_summary()
+                            
                             present_count = sum(attendance_dict.values())
                             st.success(f"✅ Attendance saved! {present_count}/{len(members)} members present")
                             time.sleep(2)
@@ -364,6 +456,218 @@ def attendance_page():
                 if st.button("Clear Cache & Retry", key="debug_retry"):
                     st.cache_data.clear()
                     st.rerun()
+
+def welfare_page():
+    """Welfare contribution collection page"""
+    st.title("💝 Welfare Contributions")
+    
+    st.info("💡 Search for members and record their welfare contributions")
+    
+    # Search for members
+    search_term = st.text_input("🔍 Search Member Name", placeholder="Type member name...")
+    
+    members_df = get_cached_members_master()
+    
+    if search_term and not members_df.empty:
+        # Search in Member_Name column
+        results = members_df[members_df['Member_Name'].str.contains(search_term, case=False, na=False)]
+        
+        if not results.empty:
+            st.success(f"Found {len(results)} member(s)")
+            
+            # Multi-select members
+            selected_members = st.multiselect(
+                "Select Members (can select multiple)",
+                options=results['Member_Name'].tolist(),
+                format_func=lambda x: f"{x} - {results[results['Member_Name']==x]['Home_Cell_Group'].iloc[0]}"
+            )
+            
+            if selected_members:
+                st.divider()
+                st.subheader("Enter Welfare Contributions")
+                
+                # Collect contributions
+                contributions = {}
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    contribution_date = st.date_input("Date", value=date.today())
+                
+                with col2:
+                    # Option for single amount or individual amounts
+                    amount_type = st.radio("Amount Entry", ["Same for all", "Individual amounts"])
+                
+                if amount_type == "Same for all":
+                    common_amount = st.number_input("Amount (GHS) for all selected", min_value=0.0, step=5.0)
+                    for member in selected_members:
+                        contributions[member] = common_amount
+                else:
+                    for member in selected_members:
+                        member_cell = results[results['Member_Name']==member]['Home_Cell_Group'].iloc[0]
+                        contributions[member] = st.number_input(
+                            f"Amount (GHS) for {member} ({member_cell})", 
+                            min_value=0.0, 
+                            step=5.0,
+                            key=f"welfare_{member}"
+                        )
+                
+                st.divider()
+                
+                col1, col2, col3 = st.columns([1, 1, 1])
+                with col2:
+                    if st.button("💾 Submit Contributions", use_container_width=True, type="primary"):
+                        # Validate at least one amount entered
+                        if all(amount == 0 for amount in contributions.values()):
+                            st.warning("Please enter at least one contribution amount")
+                        else:
+                            with st.spinner("Saving contributions..."):
+                                new_records = []
+                                total_amount = 0
+                                
+                                for member_name, amount in contributions.items():
+                                    if amount > 0:  # Only save non-zero contributions
+                                        member_cell = results[results['Member_Name']==member_name]['Home_Cell_Group'].iloc[0]
+                                        new_records.append({
+                                            'Date': str(contribution_date),
+                                            'Member_Name': member_name,
+                                            'Home_Cell_Group': member_cell,
+                                            'Amount_GHS': amount,
+                                            'Collected_By': st.session_state.username,
+                                            'Timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                        })
+                                        total_amount += amount
+                                
+                                if new_records:
+                                    # Append to welfare sheet
+                                    new_df = pd.DataFrame(new_records)
+                                    if append_sheet_data(WELFARE_TAB, new_df):
+                                        st.success(f"✅ {len(new_records)} contribution(s) recorded! Total: GHS {total_amount:.2f}")
+                                        time.sleep(2)
+                                        st.rerun()
+                                    else:
+                                        st.error("❌ Failed to save contributions. Please try again.")
+        else:
+            st.warning("No members found with that name")
+    
+    # Display recent contributions
+    st.divider()
+    st.subheader("Recent Welfare Contributions")
+    
+    welfare_df = get_sheet_data(WELFARE_TAB)
+    if not welfare_df.empty:
+        # Sort by timestamp
+        if 'Timestamp' in welfare_df.columns:
+            welfare_df = welfare_df.sort_values('Timestamp', ascending=False)
+        
+        # Show recent records
+        recent = welfare_df.head(20)
+        st.dataframe(
+            recent[['Date', 'Member_Name', 'Home_Cell_Group', 'Amount_GHS', 'Collected_By']], 
+            use_container_width=True, 
+            hide_index=True
+        )
+        
+        # Summary statistics
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            total_welfare = welfare_df['Amount_GHS'].sum()
+            st.metric("Total Welfare Collected", f"GHS {total_welfare:,.2f}")
+        
+        with col2:
+            unique_contributors = welfare_df['Member_Name'].nunique()
+            st.metric("Unique Contributors", unique_contributors)
+        
+        with col3:
+            if 'Date' in welfare_df.columns:
+                # Today's collection
+                today_welfare = welfare_df[welfare_df['Date'] == str(date.today())]
+                today_total = today_welfare['Amount_GHS'].sum() if not today_welfare.empty else 0
+                st.metric("Today's Collection", f"GHS {today_total:.2f}")
+    else:
+        st.info("No welfare contributions recorded yet")
+
+def attendance_summary_page():
+    """Attendance summary - members at risk"""
+    st.title("⚠️ Attendance Summary - Members at Risk")
+    
+    # Check role - only cell leaders and admin
+    if st.session_state.role not in ['Home Cell Leader', 'Admin']:
+        st.warning("Only Home Cell Leaders and Admins can view this page.")
+        return
+    
+    st.info("📞 Members who missed 2 or more out of the last 3 church services")
+    
+    # Add refresh button
+    col1, col2 = st.columns([3, 1])
+    with col2:
+        if st.button("🔄 Refresh Summary"):
+            with st.spinner("Updating attendance summary..."):
+                if update_attendance_summary():
+                    st.success("Summary updated!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.warning("Not enough attendance data yet (need at least 3 services)")
+    
+    # Get summary data
+    summary_df = get_sheet_data(ATTENDANCE_SUMMARY_TAB)
+    
+    if not summary_df.empty:
+        # Filter by home cell if not admin
+        if st.session_state.role == 'Home Cell Leader':
+            summary_df = summary_df[summary_df['Home_Cell_Group'] == st.session_state.home_cell]
+            st.subheader(f"Your Cell: {st.session_state.home_cell}")
+        
+        if not summary_df.empty:
+            st.metric("Members Needing Contact", len(summary_df))
+            
+            st.divider()
+            
+            # Display members at risk
+            for idx, row in summary_df.iterrows():
+                with st.expander(f"⚠️ {row['Member_Name']} - {row['Home_Cell_Group']}"):
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.write(f"**Last 3 Attendances:** {row['Last_3_Attendances']}")
+                        st.write(f"**Missed Count:** {row['Missed_Count']} out of 3")
+                        st.write(f"**Status:** {row['Status']}")
+                    
+                    with col2:
+                        # Get member phone from members master
+                        members_df = get_cached_members_master()
+                        if not members_df.empty:
+                            member_info = members_df[members_df['Member_Name'] == row['Member_Name']]
+                            if not member_info.empty:
+                                phone = member_info.iloc[0].get('Phone', 'N/A')
+                                st.write(f"**Phone:** {phone}")
+                                if phone != 'N/A':
+                                    st.markdown(f"📱 [Call {phone}](tel:{phone})")
+                    
+                    st.caption(f"Last Updated: {row['Last_Updated']}")
+        else:
+            st.success("✅ Great! No members at risk in your cell!")
+    else:
+        st.info("No attendance summary available yet. Mark attendance for at least 3 services to generate the summary.")
+        
+        # Show instruction
+        with st.expander("ℹ️ How does this work?"):
+            st.write("""
+            **Attendance Summary tracks members who need pastoral care:**
+            
+            1. System tracks the last 3 church services
+            2. Members who missed 2 or more services are flagged as "⚠️ DANGER"
+            3. Cell leaders can see their at-risk members with contact information
+            4. Summary updates automatically when attendance is marked
+            5. Call or visit these members to ensure they're okay!
+            
+            **Benefits:**
+            - Early identification of members drifting away
+            - Easy access to contact information
+            - Helps maintain strong fellowship
+            """)
 
 def offerings_page():
     """Offerings entry page"""
@@ -433,395 +737,3 @@ def offerings_page():
         st.metric("Total Offerings", f"GHS {total:,.2f}")
     else:
         st.info("No offerings recorded yet")
-
-def search_members_page():
-    """Search members page"""
-    st.title("🔍 Search Members")
-    
-    search_term = st.text_input("Search by Name", placeholder="Enter member name...")
-    
-    if search_term:
-        members_df = get_cached_members_master()
-        
-        if not members_df.empty:
-            # Search in Member_Name column
-            results = members_df[members_df['Member_Name'].str.contains(search_term, case=False, na=False)]
-            
-            if not results.empty:
-                st.success(f"Found {len(results)} member(s)")
-                
-                # Display results
-                for idx, row in results.iterrows():
-                    with st.expander(f"👤 {row['Member_Name']}"):
-                        col1, col2 = st.columns(2)
-                        
-                        with col1:
-                            st.write(f"**Home Cell:** {row.get('Home_Cell_Group', 'N/A')}")
-                            st.write(f"**Phone:** {row.get('Phone', 'N/A')}")
-                            st.write(f"**Gender:** {row.get('Gender', 'N/A')}")
-                            st.write(f"**Marital Status:** {row.get('Marital Status', 'N/A')}")
-                        
-                        with col2:
-                            st.write(f"**Email:** {row.get('Email', 'N/A')}")
-                            st.write(f"**Member Type:** {row.get('Member Type', 'N/A')}")
-                            st.write(f"**City:** {row.get('City', 'N/A')}")
-                            # Handle date of birth with trailing space
-                            dob = row.get('Date of Birth ', row.get('Date of Birth', 'N/A'))
-                            st.write(f"**Date of Birth:** {dob}")
-            else:
-                st.warning("No members found with that name")
-        else:
-            st.error("Could not load members data")
-    else:
-        # Show summary
-        members_df = get_cached_members_master()
-        if not members_df.empty:
-            st.info(f"Total Members: {len(members_df)}")
-            
-            # Group by home cell
-            if 'Home_Cell_Group' in members_df.columns:
-                cell_counts = members_df['Home_Cell_Group'].value_counts()
-                st.subheader("Members by Home Cell")
-                st.bar_chart(cell_counts)
-
-def announcements_page():
-    """Announcements page"""
-    st.title("📢 Announcements")
-    
-    # Post announcement (Admin only)
-    if st.session_state.role == 'Admin':
-        with st.expander("➕ Post New Announcement"):
-            title = st.text_input("Title")
-            message = st.text_area("Message")
-            
-            if st.button("Post Announcement"):
-                if title and message:
-                    with st.spinner("Posting announcement..."):
-                        new_announcement = {
-                            'Date': str(date.today()),
-                            'Title': title,
-                            'Message': message,
-                            'Posted_By': st.session_state.username,
-                            'Timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        }
-                        
-                        if append_sheet_data(ANNOUNCEMENTS_TAB, new_announcement):
-                            st.success("✅ Announcement posted!")
-                            time.sleep(2)
-                            st.rerun()
-                        else:
-                            st.error("❌ Failed to post announcement. Please try again.")
-                else:
-                    st.warning("Please fill in both title and message")
-    
-    # Display announcements
-    st.subheader("Recent Announcements")
-    announcements_df = get_sheet_data(ANNOUNCEMENTS_TAB)
-    
-    if not announcements_df.empty:
-        if 'Timestamp' in announcements_df.columns:
-            announcements_df = announcements_df.sort_values('Timestamp', ascending=False)
-        
-        for idx, row in announcements_df.head(10).iterrows():
-            with st.container():
-                st.markdown(f"### 📌 {row['Title']}")
-                st.write(row['Message'])
-                st.caption(f"Posted on {row['Date']} by {row['Posted_By']}")
-                st.divider()
-    else:
-        st.info("No announcements yet")
-
-def admin_page():
-    """Admin management page"""
-    st.title("⚙️ Admin Panel")
-    
-    if st.session_state.role != 'Admin':
-        st.warning("Admin access only")
-        return
-    
-    tab1, tab2, tab3 = st.tabs(["Users Management", "Reports", "System Info"])
-    
-    with tab1:
-        st.subheader("➕ Add New User")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            new_username = st.text_input("Username")
-            new_password = st.text_input("Password", type="password")
-        
-        with col2:
-            new_role = st.selectbox("Role", ["Home Cell Leader", "Accountant", "Admin"])
-            
-            if new_role == "Home Cell Leader":
-                home_cells = get_home_cell_groups()
-                if home_cells:
-                    new_home_cell = st.selectbox("Home Cell Group", home_cells)
-                else:
-                    st.warning("No home cell groups found")
-                    new_home_cell = "N/A"
-            else:
-                new_home_cell = "N/A"
-        
-        if st.button("Add User", type="primary"):
-            if new_username and new_password:
-                users_df = get_sheet_data(USERS_TAB)
-                
-                # Check if username exists
-                if not users_df.empty and new_username in users_df['Username'].values:
-                    st.error("❌ Username already exists!")
-                # Check if home cell leader already exists for this cell
-                elif new_role == "Home Cell Leader":
-                    existing_leader = users_df[
-                        (users_df['Role'] == 'Home Cell Leader') & 
-                        (users_df['Home_Cell_Group'] == new_home_cell)
-                    ]
-                    if not existing_leader.empty:
-                        st.error(f"❌ A Home Cell Leader already exists for {new_home_cell}: {existing_leader.iloc[0]['Username']}")
-                        st.info("💡 You can edit the existing user below or choose a different home cell.")
-                    else:
-                        new_user = {
-                            'Username': new_username,
-                            'Password': new_password,
-                            'Role': new_role,
-                            'Home_Cell_Group': new_home_cell
-                        }
-                        
-                        if append_sheet_data(USERS_TAB, new_user):
-                            st.success(f"✅ User {new_username} added!")
-                            time.sleep(1)
-                            st.rerun()
-                else:
-                    new_user = {
-                        'Username': new_username,
-                        'Password': new_password,
-                        'Role': new_role,
-                        'Home_Cell_Group': new_home_cell
-                    }
-                    
-                    if append_sheet_data(USERS_TAB, new_user):
-                        st.success(f"✅ User {new_username} added!")
-                        time.sleep(1)
-                        st.rerun()
-            else:
-                st.warning("Please fill in all fields")
-        
-        st.divider()
-        st.subheader("👥 Manage Existing Users")
-        users_df = get_sheet_data(USERS_TAB)
-        if not users_df.empty:
-            
-            # Select user to edit
-            edit_username = st.selectbox(
-                "Select User to Edit/Delete", 
-                users_df['Username'].tolist(),
-                key="edit_user_select"
-            )
-            
-            if edit_username:
-                user_data = users_df[users_df['Username'] == edit_username].iloc[0]
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.info(f"**Editing:** {edit_username}")
-                    new_pass = st.text_input("New Password (leave blank to keep current)", type="password", key="edit_pass")
-                    
-                    edit_role = st.selectbox(
-                        "Role", 
-                        ["Home Cell Leader", "Accountant", "Admin"],
-                        index=["Home Cell Leader", "Accountant", "Admin"].index(user_data['Role']) if user_data['Role'] in ["Home Cell Leader", "Accountant", "Admin"] else 0,
-                        key="edit_role"
-                    )
-                
-                with col2:
-                    st.write("")  # Spacing
-                    st.write("")
-                    if edit_role == "Home Cell Leader":
-                        home_cells = get_home_cell_groups()
-                        if home_cells and user_data['Home_Cell_Group'] in home_cells:
-                            current_cell_idx = home_cells.index(user_data['Home_Cell_Group'])
-                        else:
-                            current_cell_idx = 0
-                        edit_home_cell = st.selectbox(
-                            "Home Cell Group", 
-                            home_cells if home_cells else ["N/A"],
-                            index=current_cell_idx,
-                            key="edit_home_cell"
-                        )
-                    else:
-                        edit_home_cell = "N/A"
-                
-                col_update, col_delete = st.columns(2)
-                
-                with col_update:
-                    if st.button("💾 Update User", use_container_width=True, type="primary"):
-                        # Check for duplicate home cell leader (if changing to different cell)
-                        if edit_role == "Home Cell Leader" and edit_home_cell != user_data['Home_Cell_Group']:
-                            existing_leader = users_df[
-                                (users_df['Role'] == 'Home Cell Leader') & 
-                                (users_df['Home_Cell_Group'] == edit_home_cell) &
-                                (users_df['Username'] != edit_username)
-                            ]
-                            if not existing_leader.empty:
-                                st.error(f"❌ A Home Cell Leader already exists for {edit_home_cell}")
-                            else:
-                                # Update user
-                                users_df.loc[users_df['Username'] == edit_username, 'Role'] = edit_role
-                                users_df.loc[users_df['Username'] == edit_username, 'Home_Cell_Group'] = edit_home_cell
-                                if new_pass:
-                                    users_df.loc[users_df['Username'] == edit_username, 'Password'] = new_pass
-                                
-                                if write_sheet_data(USERS_TAB, users_df):
-                                    st.success(f"✅ User {edit_username} updated!")
-                                    time.sleep(1)
-                                    st.rerun()
-                        else:
-                            # Update user
-                            users_df.loc[users_df['Username'] == edit_username, 'Role'] = edit_role
-                            users_df.loc[users_df['Username'] == edit_username, 'Home_Cell_Group'] = edit_home_cell
-                            if new_pass:
-                                users_df.loc[users_df['Username'] == edit_username, 'Password'] = new_pass
-                            
-                            if write_sheet_data(USERS_TAB, users_df):
-                                st.success(f"✅ User {edit_username} updated!")
-                                time.sleep(1)
-                                st.rerun()
-                
-                with col_delete:
-                    if st.button("🗑️ Delete User", use_container_width=True, type="secondary"):
-                        if edit_username == "admin":
-                            st.error("❌ Cannot delete admin account!")
-                        else:
-                            # Confirm deletion
-                            if st.session_state.get('confirm_delete') != edit_username:
-                                st.session_state.confirm_delete = edit_username
-                                st.warning("⚠️ Click again to confirm deletion")
-                            else:
-                                users_df = users_df[users_df['Username'] != edit_username]
-                                if write_sheet_data(USERS_TAB, users_df):
-                                    st.session_state.confirm_delete = None
-                                    st.success(f"✅ User {edit_username} deleted!")
-                                    time.sleep(1)
-                                    st.rerun()
-            
-            st.divider()
-            st.subheader("All Users")
-            # Don't show passwords
-            display_df = users_df[['Username', 'Role', 'Home_Cell_Group']]
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
-    
-    with tab2:
-        st.subheader("Attendance Reports")
-        
-        # Overall statistics
-        attendance_df = get_sheet_data(ATTENDANCE_TAB)
-        if not attendance_df.empty:
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                total_records = len(attendance_df)
-                st.metric("Total Records", total_records)
-            
-            with col2:
-                present_count = len(attendance_df[attendance_df['Present'] == 'Yes'])
-                st.metric("Total Present", present_count)
-            
-            with col3:
-                if total_records > 0:
-                    attendance_rate = (present_count / total_records) * 100
-                    st.metric("Attendance Rate", f"{attendance_rate:.1f}%")
-            
-            # Recent attendance by cell
-            st.subheader("Recent Attendance by Home Cell")
-            if 'Date' in attendance_df.columns:
-                recent_dates = attendance_df['Date'].unique()[-4:]  # Last 4 dates
-                
-                for date_val in sorted(recent_dates, reverse=True):
-                    with st.expander(f"📅 {date_val}"):
-                        date_data = attendance_df[attendance_df['Date'] == date_val]
-                        cell_summary = date_data.groupby('Home_Cell_Group')['Present'].apply(
-                            lambda x: f"{(x == 'Yes').sum()}/{len(x)}"
-                        )
-                        st.dataframe(cell_summary, use_container_width=True)
-        else:
-            st.info("No attendance data yet")
-    
-    with tab3:
-        st.subheader("System Information")
-        
-        members_df = get_cached_members_master()
-        if not members_df.empty:
-            st.metric("Total Members", len(members_df))
-        
-        home_cells = get_home_cell_groups()
-        st.metric("Total Home Cell Groups", len(home_cells))
-        
-        st.write("**Home Cell Groups:**")
-        for cell in home_cells:
-            st.write(f"- {cell}")
-        
-        st.divider()
-        st.info("💾 **Data Storage:** All data is stored in Google Sheets and persists permanently!")
-        
-        # Add cache clear button
-        if st.button("🔄 Clear All Cache", help="Clear cached data and reload from Google Sheets"):
-            st.cache_data.clear()
-            st.success("Cache cleared! Page will reload.")
-            time.sleep(1)
-            st.rerun()
-
-# Main App
-def main():
-    st.set_page_config(
-        page_title="Church Attendance System",
-        page_icon="🏛️",
-        layout="wide"
-    )
-    
-    # Check if logged in
-    if not st.session_state.logged_in:
-        login_page()
-    else:
-        # Sidebar
-        with st.sidebar:
-            st.title("🏛️ Church System")
-            st.write(f"👤 **{st.session_state.username}**")
-            st.write(f"Role: {st.session_state.role}")
-            
-            if st.session_state.home_cell and st.session_state.home_cell != "N/A":
-                st.write(f"Cell: {st.session_state.home_cell}")
-            
-            st.divider()
-            
-            # Navigation
-            page = st.radio("Navigation", [
-                "📋 Attendance",
-                "💰 Offerings",
-                "🔍 Search Members",
-                "📢 Announcements",
-                "⚙️ Admin Panel"
-            ])
-            
-            st.divider()
-            
-            if st.button("🚪 Logout"):
-                st.session_state.logged_in = False
-                st.session_state.username = None
-                st.session_state.role = None
-                st.session_state.home_cell = None
-                st.rerun()
-        
-        # Main content
-        if page == "📋 Attendance":
-            attendance_page()
-        elif page == "💰 Offerings":
-            offerings_page()
-        elif page == "🔍 Search Members":
-            search_members_page()
-        elif page == "📢 Announcements":
-            announcements_page()
-        elif page == "⚙️ Admin Panel":
-            admin_page()
-
-if __name__ == "__main__":
-    main()
