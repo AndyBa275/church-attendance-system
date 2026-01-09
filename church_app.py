@@ -155,7 +155,10 @@ def get_members_by_cell(home_cell):
     return pd.DataFrame()
 
 def update_attendance_summary():
-    """Update attendance summary with members at risk"""
+    """
+    MISSION-BASED LOGIC: Flag members who miss 2+ of last 3 services
+    BUT remove flag IMMEDIATELY when they attend (mission accomplished!)
+    """
     try:
         attendance_df = get_sheet_data(ATTENDANCE_TAB)
         members_df = get_cached_members_master()
@@ -182,19 +185,24 @@ def update_attendance_summary():
                 
                 attendance_status = []
                 missed_count = 0
+                has_attended_recently = False
                 
                 for date_val in unique_dates:
                     date_record = member_attendance[member_attendance['Date'] == date_val]
                     if not date_record.empty:
                         status = date_record.iloc[0]['Present']
                         attendance_status.append(status)
-                        if status == 'No':
+                        if status == 'Yes':
+                            has_attended_recently = True
+                        elif status == 'No':
                             missed_count += 1
                     else:
                         attendance_status.append('No')
                         missed_count += 1
                 
-                if missed_count >= 2:
+                # MISSION LOGIC: Only flag if missed 2+ AND has NOT attended recently
+                # If they attended even ONCE in last 3 services → Mission accomplished! Remove flag!
+                if missed_count >= 2 and not has_attended_recently:
                     summary_records.append({
                         'Member_Name': member_name,
                         'Home_Cell_Group': home_cell,
@@ -341,83 +349,204 @@ def attendance_page():
             st.warning(f"No members found in {selected_cell}")
 
 def welfare_page():
-    """Welfare contribution collection"""
+    """Welfare contribution collection - ALL MEMBERS DISPLAYED"""
     st.title("💝 Welfare Contributions")
-    st.info("💡 Search members and record their welfare contributions")
+    st.info("💡 Enter amounts for members who are contributing today")
     
-    search_term = st.text_input("🔍 Search Member Name", placeholder="Type name...")
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        contribution_date = st.date_input("Date", value=date.today())
+    with col2:
+        if st.button("🔄 Refresh"):
+            st.cache_data.clear()
+            st.rerun()
+    
+    # Search filter (optional)
+    search_term = st.text_input("🔍 Search to filter list (optional)", placeholder="Type name to filter...")
+    
+    st.divider()
+    
+    # Get all members
     members_df = get_cached_members_master()
     
-    if search_term and not members_df.empty:
-        results = members_df[members_df['Member_Name'].str.contains(search_term, case=False, na=False)]
+    if members_df.empty:
+        st.warning("No members found in Members Master sheet")
+        return
+    
+    # Sort members by name for easier navigation
+    members_df = members_df.sort_values('Member_Name')
+    
+    # Filter by search term if provided
+    if search_term:
+        filtered_members = members_df[members_df['Member_Name'].str.contains(search_term, case=False, na=False)]
+        st.info(f"📊 Showing {len(filtered_members)} of {len(members_df)} members")
+    else:
+        filtered_members = members_df
+        st.info(f"📊 Showing all {len(members_df)} members")
+    
+    if filtered_members.empty:
+        st.warning("No members match your search")
+        return
+    
+    st.subheader("Enter Welfare Amounts")
+    st.caption("Only members with amounts entered will be recorded")
+    
+    # Initialize session state for amounts if not exists
+    if 'welfare_amounts' not in st.session_state:
+        st.session_state.welfare_amounts = {}
+    
+    # Create table header
+    col1, col2, col3 = st.columns([3, 2, 2])
+    with col1:
+        st.markdown("**Member Name**")
+    with col2:
+        st.markdown("**Home Cell**")
+    with col3:
+        st.markdown("**Amount (GHS)**")
+    
+    st.markdown("---")
+    
+    # Store welfare inputs
+    welfare_inputs = {}
+    
+    # Display each member with input
+    for idx, row in filtered_members.iterrows():
+        member_name = row['Member_Name']
+        home_cell = row.get('Home_Cell_Group', 'N/A')
         
-        if not results.empty:
-            st.success(f"Found {len(results)} member(s)")
-            
-            selected_members = st.multiselect(
-                "Select Members (can select multiple)",
-                options=results['Member_Name'].tolist(),
-                format_func=lambda x: f"{x} - {results[results['Member_Name']==x]['Home_Cell_Group'].iloc[0]}"
+        col1, col2, col3 = st.columns([3, 2, 2])
+        
+        with col1:
+            st.write(member_name)
+        with col2:
+            st.caption(home_cell)
+        with col3:
+            # Get previous value if exists
+            prev_value = st.session_state.welfare_amounts.get(member_name, 0.0)
+            amount = st.number_input(
+                f"Amount for {member_name}", 
+                min_value=0.0, 
+                step=5.0,
+                value=prev_value,
+                key=f"welfare_{member_name}_{idx}",
+                label_visibility="collapsed"
             )
+            welfare_inputs[member_name] = {
+                'amount': amount,
+                'home_cell': home_cell
+            }
+            # Update session state
+            st.session_state.welfare_amounts[member_name] = amount
+    
+    st.divider()
+    
+    # Submit button
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col2:
+        if st.button("💾 Submit All Entries", use_container_width=True, type="primary"):
+            # Filter only members with amounts > 0
+            contributing_members = {name: data for name, data in welfare_inputs.items() if data['amount'] > 0}
             
-            if selected_members:
-                st.divider()
-                st.subheader("Enter Welfare Contributions")
+            if not contributing_members:
+                st.warning("⚠️ No amounts entered. Please enter at least one amount > 0.")
+            else:
+                # Check for duplicates on same date
+                welfare_df = get_sheet_data(WELFARE_TAB)
+                duplicates = []
                 
-                contributions = {}
-                col1, col2 = st.columns(2)
+                if not welfare_df.empty:
+                    for member_name, data in contributing_members.items():
+                        existing = welfare_df[
+                            (welfare_df['Member_Name'] == member_name) & 
+                            (welfare_df['Date'] == str(contribution_date))
+                        ]
+                        
+                        if not existing.empty:
+                            existing_amount = existing['Amount_GHS'].sum()
+                            new_amount = data['amount']
+                            total_amount = existing_amount + new_amount
+                            
+                            duplicates.append({
+                                'name': member_name,
+                                'existing': existing_amount,
+                                'new': new_amount,
+                                'total': total_amount
+                            })
                 
-                with col1:
-                    contribution_date = st.date_input("Date", value=date.today())
-                with col2:
-                    amount_type = st.radio("Amount Entry", ["Same for all", "Individual amounts"])
-                
-                if amount_type == "Same for all":
-                    common_amount = st.number_input("Amount (GHS) for all", min_value=0.0, step=5.0)
-                    for member in selected_members:
-                        contributions[member] = common_amount
-                else:
-                    for member in selected_members:
-                        member_cell = results[results['Member_Name']==member]['Home_Cell_Group'].iloc[0]
-                        contributions[member] = st.number_input(
-                            f"Amount for {member} ({member_cell})", 
-                            min_value=0.0, 
-                            step=5.0,
-                            key=f"welfare_{member}"
-                        )
-                
-                st.divider()
-                col1, col2, col3 = st.columns([1, 1, 1])
-                with col2:
-                    if st.button("💾 Submit", use_container_width=True, type="primary"):
-                        if all(amount == 0 for amount in contributions.values()):
-                            st.warning("Enter at least one amount")
-                        else:
+                # Show duplicate warning if found
+                if duplicates:
+                    st.warning("⚠️ **Duplicate Entry Detected!**")
+                    st.write("The following members already have welfare recorded today:")
+                    st.write("")
+                    
+                    for dup in duplicates:
+                        st.write(f"**{dup['name']}**")
+                        st.write(f"- Existing today: GHS {dup['existing']:.2f}")
+                        st.write(f"- New amount: GHS {dup['new']:.2f}")
+                        st.write(f"- **Total if added: GHS {dup['total']:.2f}**")
+                        st.write("")
+                    
+                    st.write("**Do you want to ADD these new amounts to their existing entries?**")
+                    st.caption("Both records will be kept for audit trail. Reports will sum them by date + member.")
+                    
+                    col_yes, col_no = st.columns(2)
+                    with col_yes:
+                        if st.button("✅ Yes, Add to Existing", use_container_width=True, type="primary", key="confirm_add"):
+                            # Proceed with saving
                             with st.spinner("Saving..."):
                                 new_records = []
                                 total_amount = 0
                                 
-                                for member_name, amount in contributions.items():
-                                    if amount > 0:
-                                        member_cell = results[results['Member_Name']==member_name]['Home_Cell_Group'].iloc[0]
-                                        new_records.append({
-                                            'Date': str(contribution_date),
-                                            'Member_Name': member_name,
-                                            'Home_Cell_Group': member_cell,
-                                            'Amount_GHS': amount,
-                                            'Collected_By': st.session_state.username,
-                                            'Timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                        })
-                                        total_amount += amount
+                                for member_name, data in contributing_members.items():
+                                    new_records.append({
+                                        'Date': str(contribution_date),
+                                        'Member_Name': member_name,
+                                        'Home_Cell_Group': data['home_cell'],
+                                        'Amount_GHS': data['amount'],
+                                        'Collected_By': st.session_state.username,
+                                        'Timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                    })
+                                    total_amount += data['amount']
                                 
-                                if new_records:
-                                    new_df = pd.DataFrame(new_records)
-                                    if append_sheet_data(WELFARE_TAB, new_df):
-                                        st.success(f"✅ {len(new_records)} recorded! Total: GHS {total_amount:.2f}")
-                                        time.sleep(2)
-                                        st.rerun()
-        else:
-            st.warning("No members found")
+                                new_df = pd.DataFrame(new_records)
+                                if append_sheet_data(WELFARE_TAB, new_df):
+                                    st.success(f"✅ {len(new_records)} entries recorded! Total: GHS {total_amount:.2f}")
+                                    st.session_state.welfare_amounts = {}  # Clear amounts
+                                    time.sleep(2)
+                                    st.rerun()
+                                else:
+                                    st.error("❌ Failed to save")
+                    
+                    with col_no:
+                        if st.button("❌ No, Cancel", use_container_width=True, key="cancel_add"):
+                            st.info("Submission cancelled. Please review and correct amounts.")
+                            st.stop()
+                
+                else:
+                    # No duplicates, proceed directly
+                    with st.spinner("Saving..."):
+                        new_records = []
+                        total_amount = 0
+                        
+                        for member_name, data in contributing_members.items():
+                            new_records.append({
+                                'Date': str(contribution_date),
+                                'Member_Name': member_name,
+                                'Home_Cell_Group': data['home_cell'],
+                                'Amount_GHS': data['amount'],
+                                'Collected_By': st.session_state.username,
+                                'Timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            })
+                            total_amount += data['amount']
+                        
+                        new_df = pd.DataFrame(new_records)
+                        if append_sheet_data(WELFARE_TAB, new_df):
+                            st.success(f"✅ {len(new_records)} entries recorded! Total: GHS {total_amount:.2f}")
+                            st.session_state.welfare_amounts = {}  # Clear amounts
+                            time.sleep(2)
+                            st.rerun()
+                        else:
+                            st.error("❌ Failed to save")
     
     st.divider()
     st.subheader("Recent Welfare Contributions")
@@ -447,14 +576,15 @@ def welfare_page():
         st.info("No contributions recorded yet")
 
 def attendance_summary_page():
-    """Attendance summary - members at risk"""
+    """Attendance summary - members at risk (MISSION-BASED)"""
     st.title("⚠️ Members at Risk")
     
     if st.session_state.role not in ['Home Cell Leader', 'Admin']:
         st.warning("Only Cell Leaders and Admins can view this.")
         return
     
-    st.info("📞 Members who missed 2+ out of last 3 services")
+    st.info("📞 Members who missed 2+ of last 3 services AND have NOT attended recently")
+    st.caption("✅ Flag removed immediately when member attends - Mission accomplished!")
     
     col1, col2 = st.columns([3, 1])
     with col2:
@@ -483,7 +613,7 @@ def attendance_summary_page():
                     col1, col2 = st.columns(2)
                     
                     with col1:
-                        st.write(f"**Last 3:** {row['Last_3_Attendances']}")
+                        st.write(f"**Last 3 Services:** {row['Last_3_Attendances']}")
                         st.write(f"**Missed:** {row['Missed_Count']} of 3")
                         st.write(f"**Status:** {row['Status']}")
                     
@@ -494,14 +624,14 @@ def attendance_summary_page():
                             if not member_info.empty:
                                 phone = member_info.iloc[0].get('Phone', 'N/A')
                                 st.write(f"**Phone:** {phone}")
-                                if phone != 'N/A':
-                                    st.markdown(f"📱 [Call](tel:{phone})")
+                                if phone != 'N/A' and phone != '':
+                                    st.markdown(f"📱 [Call {phone}](tel:{phone})")
                     
-                    st.caption(f"Updated: {row['Last_Updated']}")
+                    st.caption(f"Last Updated: {row['Last_Updated']}")
         else:
-            st.success("✅ No members at risk in your cell!")
+            st.success("✅ No members at risk in your cell! Everyone is engaged!")
     else:
-        st.info("No summary yet. Need at least 3 services.")
+        st.info("No summary yet. Need at least 3 services recorded.")
 
 def offerings_page():
     """Offerings entry"""
@@ -540,6 +670,8 @@ def offerings_page():
                     st.success(f"✅ GHS {amount:.2f} recorded!")
                     time.sleep(2)
                     st.rerun()
+                else:
+                    st.error("❌ Failed to save")
         else:
             st.warning("Enter amount > 0")
     
@@ -585,7 +717,9 @@ def search_members_page():
                             st.write(f"**Email:** {row.get('Email', 'N/A')}")
                             st.write(f"**Member Type:** {row.get('Member Type', 'N/A')}")
             else:
-                st.warning("No members found")
+                st.warning("No members found matching your search")
+        else:
+            st.warning("No members in database")
     else:
         members_df = get_cached_members_master()
         if not members_df.empty:
@@ -601,11 +735,11 @@ def announcements_page():
     st.title("📢 Announcements")
     
     if st.session_state.role == 'Admin':
-        with st.expander("➕ Post New"):
+        with st.expander("➕ Post New Announcement"):
             title = st.text_input("Title")
             message = st.text_area("Message")
             
-            if st.button("Post"):
+            if st.button("Post", type="primary"):
                 if title and message:
                     with st.spinner("Posting..."):
                         new_announcement = {
@@ -620,6 +754,10 @@ def announcements_page():
                             st.success("✅ Posted!")
                             time.sleep(2)
                             st.rerun()
+                        else:
+                            st.error("❌ Failed to post")
+                else:
+                    st.warning("Please enter both title and message")
     
     st.subheader("Recent Announcements")
     announcements_df = get_sheet_data(ANNOUNCEMENTS_TAB)
@@ -661,11 +799,11 @@ def admin_page():
             else:
                 new_home_cell = "N/A"
         
-        if st.button("Add", type="primary"):
+        if st.button("Add User", type="primary"):
             if new_username and new_password:
                 users_df = get_sheet_data(USERS_TAB)
                 if not users_df.empty and new_username in users_df['Username'].values:
-                    st.error("Username exists!")
+                    st.error("❌ Username already exists!")
                 else:
                     new_user = {
                         'Username': new_username,
@@ -677,6 +815,10 @@ def admin_page():
                         st.success(f"✅ Added {new_username}!")
                         time.sleep(1)
                         st.rerun()
+                    else:
+                        st.error("❌ Failed to add user")
+            else:
+                st.warning("Please enter username and password")
         
         st.divider()
         st.subheader("Existing Users")
@@ -684,6 +826,8 @@ def admin_page():
         if not users_df.empty:
             display_df = users_df[['Username', 'Role', 'Home_Cell_Group']]
             st.dataframe(display_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No users yet")
     
     with tab2:
         st.subheader("Attendance Reports")
@@ -696,28 +840,55 @@ def admin_page():
                 present_count = len(attendance_df[attendance_df['Present'] == 'Yes'])
                 st.metric("Present", present_count)
             with col3:
-                rate = (present_count / len(attendance_df)) * 100
-                st.metric("Rate", f"{rate:.1f}%")
+                rate = (present_count / len(attendance_df)) * 100 if len(attendance_df) > 0 else 0
+                st.metric("Attendance Rate", f"{rate:.1f}%")
+            
+            st.divider()
+            st.subheader("Recent Attendance")
+            recent = attendance_df.sort_values('Timestamp', ascending=False).head(20)
+            st.dataframe(recent[['Date', 'Home_Cell_Group', 'Member_Name', 'Present', 'Recorded_By']], 
+                        use_container_width=True, hide_index=True)
         else:
-            st.info("No data yet")
+            st.info("No attendance data yet")
+        
+        st.divider()
+        st.subheader("Welfare Reports")
+        welfare_df = get_sheet_data(WELFARE_TAB)
+        if not welfare_df.empty:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Collected", f"GHS {welfare_df['Amount_GHS'].sum():,.2f}")
+            with col2:
+                st.metric("Total Contributors", welfare_df['Member_Name'].nunique())
+            with col3:
+                st.metric("Total Records", len(welfare_df))
+        else:
+            st.info("No welfare data yet")
     
     with tab3:
-        st.subheader("System Info")
+        st.subheader("System Information")
         members_df = get_cached_members_master()
         if not members_df.empty:
             st.metric("Total Members", len(members_df))
+        else:
+            st.metric("Total Members", 0)
         
         home_cells = get_home_cell_groups()
-        st.metric("Home Cells", len(home_cells))
+        st.metric("Home Cell Groups", len(home_cells))
         
-        st.write("**Cells:**")
-        for cell in home_cells:
-            st.write(f"- {cell}")
+        if home_cells:
+            st.write("**Cell Groups:**")
+            for cell in home_cells:
+                cell_members = members_df[members_df['Home_Cell_Group'] == cell] if not members_df.empty else pd.DataFrame()
+                member_count = len(cell_members)
+                st.write(f"- {cell}: {member_count} members")
         
         st.divider()
-        if st.button("🔄 Clear Cache"):
+        st.subheader("System Actions")
+        if st.button("🔄 Clear Cache & Refresh", use_container_width=True):
             st.cache_data.clear()
-            st.success("Cleared!")
+            st.cache_resource.clear()
+            st.success("✅ Cache cleared!")
             time.sleep(1)
             st.rerun()
 
@@ -734,10 +905,10 @@ def main():
         with st.sidebar:
             st.title("🏛️ Church System")
             st.write(f"👤 **{st.session_state.username}**")
-            st.write(f"Role: {st.session_state.role}")
+            st.write(f"Role: **{st.session_state.role}**")
             
             if st.session_state.home_cell and st.session_state.home_cell != "N/A":
-                st.write(f"Cell: {st.session_state.home_cell}")
+                st.write(f"Cell: **{st.session_state.home_cell}**")
             
             st.divider()
             
@@ -753,7 +924,7 @@ def main():
             
             st.divider()
             
-            if st.button("🚪 Logout"):
+            if st.button("🚪 Logout", use_container_width=True):
                 st.session_state.logged_in = False
                 st.session_state.username = None
                 st.session_state.role = None
