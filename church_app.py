@@ -29,20 +29,59 @@ if 'logged_in' not in st.session_state:
 
 @st.cache_resource
 def get_google_sheets_client():
-    """Initialize Google Sheets client"""
+    """Initialize Google Sheets client with better error handling"""
     try:
+        # Try to get credentials from Streamlit secrets
         if hasattr(st, 'secrets') and 'gcp_service_account' in st.secrets:
             credentials_dict = dict(st.secrets['gcp_service_account'])
+            st.info("✅ Using credentials from Streamlit secrets")
         else:
+            # Fallback to local credentials.json
             creds_path = os.path.join(os.path.dirname(__file__), 'credentials.json')
+            if not os.path.exists(creds_path):
+                st.error("❌ No credentials found! Add gcp_service_account to Streamlit secrets.")
+                st.info("To add secrets to Streamlit Cloud:")
+                st.code("""
+1. Go to appname.streamlit.app
+2. Click on 'Manage app' → 'Settings' → 'Secrets'
+3. Add your service account JSON as:
+gcp_service_account = {
+    "type": "service_account",
+    "project_id": "...",
+    "private_key_id": "...",
+    "private_key": "...",
+    "client_email": "...",
+    "client_id": "...",
+    "auth_uri": "...",
+    "token_uri": "...",
+    "auth_provider_x509_cert_url": "...",
+    "client_x509_cert_url": "..."
+}
+                """)
+                return None
             with open(creds_path, 'r') as f:
                 credentials_dict = json.load(f)
+            st.info("✅ Using credentials from local file")
         
         credentials = Credentials.from_service_account_info(credentials_dict, scopes=SCOPE)
         client = gspread.authorize(credentials)
+        
+        # Test connection
+        spreadsheet = client.open_by_key(SPREADSHEET_ID)
+        st.success("✅ Successfully connected to Google Sheets!")
         return client
+        
+    except gspread.exceptions.APIError as e:
+        st.error(f"❌ Google Sheets API Error: {str(e)}")
+        if "disabled" in str(e).lower():
+            st.warning("⚠️ Google Sheets API might be disabled. Enable it at: console.developers.google.com")
+        return None
+    except gspread.exceptions.SpreadsheetNotFound:
+        st.error(f"❌ Spreadsheet not found with ID: {SPREADSHEET_ID}")
+        st.warning("Check if: 1) Spreadsheet exists, 2) Service account has access")
+        return None
     except Exception as e:
-        st.error(f"Error connecting to Google Sheets: {str(e)}")
+        st.error(f"❌ Error connecting to Google Sheets: {str(e)}")
         return None
 
 def get_sheet_data(tab_name):
@@ -50,6 +89,7 @@ def get_sheet_data(tab_name):
     try:
         client = get_google_sheets_client()
         if client is None:
+            st.warning(f"⚠️ Could not connect to Google Sheets for {tab_name}")
             return pd.DataFrame()
         
         spreadsheet = client.open_by_key(SPREADSHEET_ID)
@@ -57,6 +97,7 @@ def get_sheet_data(tab_name):
         all_values = worksheet.get_all_values()
         
         if not all_values or len(all_values) <= 1:
+            # Return empty dataframe with appropriate columns
             if tab_name == MEMBERS_TAB:
                 return pd.DataFrame(columns=['Member_Name', 'Home_Cell_Group', 'Phone', 'Email', 'Gender'])
             elif tab_name == ATTENDANCE_TAB:
@@ -76,8 +117,16 @@ def get_sheet_data(tab_name):
         data = worksheet.get_all_records()
         if not data:
             return pd.DataFrame(columns=all_values[0])
+        
+        st.success(f"✅ Successfully loaded {len(data)} records from {tab_name}")
         return pd.DataFrame(data)
-    except:
+        
+    except gspread.exceptions.WorksheetNotFound:
+        st.error(f"❌ Worksheet '{tab_name}' not found in spreadsheet!")
+        st.warning(f"Please create a worksheet named: {tab_name}")
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"❌ Error reading {tab_name}: {str(e)}")
         return pd.DataFrame()
 
 def write_sheet_data(tab_name, df):
@@ -94,11 +143,13 @@ def write_sheet_data(tab_name, df):
         if not df.empty:
             data = [df.columns.tolist()] + df.values.tolist()
             worksheet.update('A1', data)
+            st.success(f"✅ Saved {len(df)} records to {tab_name}")
         else:
             worksheet.update('A1', [df.columns.tolist()])
+            st.info(f"📝 Initialized empty sheet for {tab_name}")
         return True
     except Exception as e:
-        st.error(f"Error writing to {tab_name}: {str(e)}")
+        st.error(f"❌ Error writing to {tab_name}: {str(e)}")
         return False
 
 def append_sheet_data(tab_name, new_data):
@@ -113,15 +164,19 @@ def append_sheet_data(tab_name, new_data):
         
         if isinstance(new_data, pd.DataFrame):
             rows = new_data.values.tolist()
+            row_count = len(rows)
         elif isinstance(new_data, dict):
             rows = [list(new_data.values())]
+            row_count = 1
         else:
             rows = [new_data]
+            row_count = 1
         
         worksheet.append_rows(rows)
+        st.success(f"✅ Appended {row_count} row(s) to {tab_name}")
         return True
     except Exception as e:
-        st.error(f"Error appending to {tab_name}: {str(e)}")
+        st.error(f"❌ Error appending to {tab_name}: {str(e)}")
         return False
 
 def verify_login(username, password):
@@ -142,7 +197,8 @@ def get_home_cell_groups():
     """Get unique home cell groups from members"""
     members_df = get_cached_members_master()
     if not members_df.empty and 'Home_Cell_Group' in members_df.columns:
-        return sorted(members_df['Home_Cell_Group'].dropna().unique().tolist())
+        groups = sorted(members_df['Home_Cell_Group'].dropna().unique().tolist())
+        return groups
     return []
 
 def get_members_by_cell(home_cell):
@@ -163,13 +219,18 @@ def update_attendance_summary():
         attendance_df = get_sheet_data(ATTENDANCE_TAB)
         members_df = get_cached_members_master()
         
-        if attendance_df.empty or members_df.empty:
+        if attendance_df.empty:
+            st.warning("No attendance data found")
+            return False
+        if members_df.empty:
+            st.warning("No members data found")
             return False
         
         if 'Date' in attendance_df.columns:
             unique_dates = sorted(attendance_df['Date'].unique(), reverse=True)[:3]
             
             if len(unique_dates) < 3:
+                st.info(f"Need at least 3 services. Currently have {len(unique_dates)}")
                 return False
             
             summary_records = []
@@ -214,13 +275,20 @@ def update_attendance_summary():
             
             if summary_records:
                 summary_df = pd.DataFrame(summary_records)
-                return write_sheet_data(ATTENDANCE_SUMMARY_TAB, summary_df)
+                success = write_sheet_data(ATTENDANCE_SUMMARY_TAB, summary_df)
+                if success:
+                    st.success(f"✅ Updated summary with {len(summary_records)} at-risk members")
+                return success
             else:
                 empty_df = pd.DataFrame(columns=['Member_Name', 'Home_Cell_Group', 'Last_3_Attendances', 
                                                 'Missed_Count', 'Status', 'Last_Updated'])
-                return write_sheet_data(ATTENDANCE_SUMMARY_TAB, empty_df)
+                success = write_sheet_data(ATTENDANCE_SUMMARY_TAB, empty_df)
+                if success:
+                    st.success("✅ No at-risk members found. Summary cleared.")
+                return success
         return False
-    except:
+    except Exception as e:
+        st.error(f"❌ Error updating attendance summary: {str(e)}")
         return False
 
 def login_page():
@@ -236,18 +304,20 @@ def login_page():
         
         if st.button("Login", use_container_width=True):
             if username and password:
-                success, role, home_cell = verify_login(username, password)
-                if success:
-                    st.session_state.logged_in = True
-                    st.session_state.username = username
-                    st.session_state.role = role
-                    st.session_state.home_cell = home_cell
-                    st.success(f"Welcome {username}!")
-                    st.rerun()
-                else:
-                    st.error("❌ Invalid username or password")
+                with st.spinner("Verifying credentials..."):
+                    success, role, home_cell = verify_login(username, password)
+                    if success:
+                        st.session_state.logged_in = True
+                        st.session_state.username = username
+                        st.session_state.role = role
+                        st.session_state.home_cell = home_cell
+                        st.success(f"✅ Welcome {username}!")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error("❌ Invalid username or password")
             else:
-                st.warning("Please enter both username and password")
+                st.warning("⚠️ Please enter both username and password")
         
         st.divider()
         st.info("📱 This system works on mobile phones! Access via browser.")
@@ -257,7 +327,7 @@ def attendance_page():
     st.title("📋 Mark Attendance")
     
     if st.session_state.role not in ['Home Cell Leader', 'Admin']:
-        st.warning("You don't have permission to mark attendance.")
+        st.warning("⚠️ You don't have permission to mark attendance.")
         return
     
     attendance_date = st.date_input("Select Date", value=date.today())
@@ -265,35 +335,42 @@ def attendance_page():
     if st.session_state.role == 'Admin':
         home_cells = get_home_cell_groups()
         if not home_cells:
-            st.warning("No home cell groups found.")
+            st.warning("❌ No home cell groups found in Members Master.")
             return
         selected_cell = st.selectbox("Select Home Cell Group", home_cells)
     else:
         selected_cell = st.session_state.home_cell
-        st.info(f"Your Home Cell: **{selected_cell}**")
+        st.info(f"📌 Your Home Cell: **{selected_cell}**")
     
     if selected_cell:
         col_title, col_refresh = st.columns([3, 1])
         with col_refresh:
-            if st.button("🔄 Refresh"):
+            if st.button("🔄 Refresh", help="Refresh member list"):
                 st.cache_data.clear()
+                st.success("✅ Cache cleared")
+                time.sleep(1)
                 st.rerun()
         
-        members = get_members_by_cell(selected_cell)
+        with st.spinner(f"Loading members from {selected_cell}..."):
+            members = get_members_by_cell(selected_cell)
         
         if not members.empty:
             st.subheader(f"Members in {selected_cell}")
-            st.write(f"Total Members: {len(members)}")
+            st.write(f"📊 Total Members: {len(members)}")
             
-            attendance_df = get_sheet_data(ATTENDANCE_TAB)
-            existing_attendance = pd.DataFrame()
-            if not attendance_df.empty:
-                existing_attendance = attendance_df[
-                    (attendance_df['Date'] == str(attendance_date)) & 
-                    (attendance_df['Home_Cell_Group'] == selected_cell)
-                ]
+            with st.spinner("Loading existing attendance..."):
+                attendance_df = get_sheet_data(ATTENDANCE_TAB)
+                existing_attendance = pd.DataFrame()
+                if not attendance_df.empty:
+                    existing_attendance = attendance_df[
+                        (attendance_df['Date'] == str(attendance_date)) & 
+                        (attendance_df['Home_Cell_Group'] == selected_cell)
+                    ]
             
             attendance_dict = {}
+            
+            st.write("---")
+            st.write("### ✅ Mark Attendance (Check = Present)")
             
             for idx, row in members.iterrows():
                 member_name = row['Member_Name']
@@ -315,7 +392,7 @@ def attendance_page():
             col1, col2, col3 = st.columns([1, 1, 1])
             with col2:
                 if st.button("💾 Submit Attendance", use_container_width=True, type="primary"):
-                    with st.spinner("Saving..."):
+                    with st.spinner("Saving attendance..."):
                         new_records = []
                         for member_name, present in attendance_dict.items():
                             new_records.append({
@@ -338,15 +415,19 @@ def attendance_page():
                         attendance_df = pd.concat([attendance_df, new_df], ignore_index=True)
                         
                         if write_sheet_data(ATTENDANCE_TAB, attendance_df):
-                            update_attendance_summary()
                             present_count = sum(attendance_dict.values())
                             st.success(f"✅ Saved! {present_count}/{len(members)} present")
+                            
+                            # Update summary
+                            with st.spinner("Updating attendance summary..."):
+                                update_attendance_summary()
+                            
                             time.sleep(2)
                             st.rerun()
                         else:
-                            st.error("❌ Failed to save")
+                            st.error("❌ Failed to save attendance")
         else:
-            st.warning(f"No members found in {selected_cell}")
+            st.warning(f"⚠️ No members found in {selected_cell}. Check Members Master sheet.")
 
 def welfare_page():
     """Welfare contribution collection - ALL MEMBERS DISPLAYED"""
@@ -359,6 +440,8 @@ def welfare_page():
     with col2:
         if st.button("🔄 Refresh"):
             st.cache_data.clear()
+            st.success("✅ Cache cleared")
+            time.sleep(1)
             st.rerun()
     
     # Search filter (optional)
@@ -367,10 +450,11 @@ def welfare_page():
     st.divider()
     
     # Get all members
-    members_df = get_cached_members_master()
+    with st.spinner("Loading members..."):
+        members_df = get_cached_members_master()
     
     if members_df.empty:
-        st.warning("No members found in Members Master sheet")
+        st.warning("⚠️ No members found in Members Master sheet")
         return
     
     # Sort members by name for easier navigation
@@ -385,7 +469,7 @@ def welfare_page():
         st.info(f"📊 Showing all {len(members_df)} members")
     
     if filtered_members.empty:
-        st.warning("No members match your search")
+        st.warning("⚠️ No members match your search")
         return
     
     st.subheader("Enter Welfare Amounts")
@@ -580,7 +664,7 @@ def attendance_summary_page():
     st.title("⚠️ Members at Risk")
     
     if st.session_state.role not in ['Home Cell Leader', 'Admin']:
-        st.warning("Only Cell Leaders and Admins can view this.")
+        st.warning("⚠️ Only Cell Leaders and Admins can view this.")
         return
     
     st.info("📞 Members who missed 2+ of last 3 services AND have NOT attended recently")
@@ -588,16 +672,14 @@ def attendance_summary_page():
     
     col1, col2 = st.columns([3, 1])
     with col2:
-        if st.button("🔄 Refresh"):
-            with st.spinner("Updating..."):
+        if st.button("🔄 Refresh & Update"):
+            with st.spinner("Updating attendance summary..."):
                 if update_attendance_summary():
-                    st.success("Updated!")
                     time.sleep(1)
                     st.rerun()
-                else:
-                    st.warning("Need at least 3 services")
     
-    summary_df = get_sheet_data(ATTENDANCE_SUMMARY_TAB)
+    with st.spinner("Loading attendance summary..."):
+        summary_df = get_sheet_data(ATTENDANCE_SUMMARY_TAB)
     
     if not summary_df.empty:
         if st.session_state.role == 'Home Cell Leader':
@@ -631,14 +713,14 @@ def attendance_summary_page():
         else:
             st.success("✅ No members at risk in your cell! Everyone is engaged!")
     else:
-        st.info("No summary yet. Need at least 3 services recorded.")
+        st.info("ℹ️ No summary yet. Need at least 3 services recorded.")
 
 def offerings_page():
     """Offerings entry"""
     st.title("💰 Offerings & Tithes")
     
     if st.session_state.role not in ['Accountant', 'Admin']:
-        st.warning("You don't have permission.")
+        st.warning("⚠️ You don't have permission.")
         return
     
     st.subheader("Enter Offering")
@@ -673,7 +755,7 @@ def offerings_page():
                 else:
                     st.error("❌ Failed to save")
         else:
-            st.warning("Enter amount > 0")
+            st.warning("⚠️ Enter amount > 0")
     
     st.divider()
     st.subheader("Recent Offerings")
@@ -687,7 +769,7 @@ def offerings_page():
                      use_container_width=True, hide_index=True)
         st.metric("Total", f"GHS {offerings_df['Amount_GHS'].sum():,.2f}")
     else:
-        st.info("No offerings yet")
+        st.info("ℹ️ No offerings recorded yet")
 
 def search_members_page():
     """Search members"""
@@ -696,13 +778,14 @@ def search_members_page():
     search_term = st.text_input("Search by Name", placeholder="Enter name...")
     
     if search_term:
-        members_df = get_cached_members_master()
+        with st.spinner("Searching members..."):
+            members_df = get_cached_members_master()
         
         if not members_df.empty:
             results = members_df[members_df['Member_Name'].str.contains(search_term, case=False, na=False)]
             
             if not results.empty:
-                st.success(f"Found {len(results)} member(s)")
+                st.success(f"✅ Found {len(results)} member(s)")
                 
                 for idx, row in results.iterrows():
                     with st.expander(f"👤 {row['Member_Name']}"):
@@ -717,18 +800,20 @@ def search_members_page():
                             st.write(f"**Email:** {row.get('Email', 'N/A')}")
                             st.write(f"**Member Type:** {row.get('Member Type', 'N/A')}")
             else:
-                st.warning("No members found matching your search")
+                st.warning("⚠️ No members found matching your search")
         else:
-            st.warning("No members in database")
+            st.warning("⚠️ No members in database")
     else:
         members_df = get_cached_members_master()
         if not members_df.empty:
-            st.info(f"Total Members: {len(members_df)}")
+            st.info(f"📊 Total Members: {len(members_df)}")
             
             if 'Home_Cell_Group' in members_df.columns:
                 cell_counts = members_df['Home_Cell_Group'].value_counts()
                 st.subheader("Members by Cell")
                 st.bar_chart(cell_counts)
+        else:
+            st.info("ℹ️ No members data available")
 
 def announcements_page():
     """Announcements"""
@@ -757,7 +842,7 @@ def announcements_page():
                         else:
                             st.error("❌ Failed to post")
                 else:
-                    st.warning("Please enter both title and message")
+                    st.warning("⚠️ Please enter both title and message")
     
     st.subheader("Recent Announcements")
     announcements_df = get_sheet_data(ANNOUNCEMENTS_TAB)
@@ -772,17 +857,17 @@ def announcements_page():
             st.caption(f"Posted on {row['Date']} by {row['Posted_By']}")
             st.divider()
     else:
-        st.info("No announcements yet")
+        st.info("ℹ️ No announcements yet")
 
 def admin_page():
     """Admin panel"""
     st.title("⚙️ Admin Panel")
     
     if st.session_state.role != 'Admin':
-        st.warning("Admin only")
+        st.warning("⚠️ Admin only")
         return
     
-    tab1, tab2, tab3 = st.tabs(["Users", "Reports", "System"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Users", "Reports", "System", "Debug"])
     
     with tab1:
         st.subheader("➕ Add User")
@@ -801,7 +886,8 @@ def admin_page():
         
         if st.button("Add User", type="primary"):
             if new_username and new_password:
-                users_df = get_sheet_data(USERS_TAB)
+                with st.spinner("Checking existing users..."):
+                    users_df = get_sheet_data(USERS_TAB)
                 if not users_df.empty and new_username in users_df['Username'].values:
                     st.error("❌ Username already exists!")
                 else:
@@ -818,7 +904,7 @@ def admin_page():
                     else:
                         st.error("❌ Failed to add user")
             else:
-                st.warning("Please enter username and password")
+                st.warning("⚠️ Please enter username and password")
         
         st.divider()
         st.subheader("Existing Users")
@@ -827,7 +913,7 @@ def admin_page():
             display_df = users_df[['Username', 'Role', 'Home_Cell_Group']]
             st.dataframe(display_df, use_container_width=True, hide_index=True)
         else:
-            st.info("No users yet")
+            st.info("ℹ️ No users yet")
     
     with tab2:
         st.subheader("Attendance Reports")
@@ -849,7 +935,7 @@ def admin_page():
             st.dataframe(recent[['Date', 'Home_Cell_Group', 'Member_Name', 'Present', 'Recorded_By']], 
                         use_container_width=True, hide_index=True)
         else:
-            st.info("No attendance data yet")
+            st.info("ℹ️ No attendance data yet")
         
         st.divider()
         st.subheader("Welfare Reports")
@@ -863,34 +949,99 @@ def admin_page():
             with col3:
                 st.metric("Total Records", len(welfare_df))
         else:
-            st.info("No welfare data yet")
+            st.info("ℹ️ No welfare data yet")
     
     with tab3:
         st.subheader("System Information")
-        members_df = get_cached_members_master()
-        if not members_df.empty:
-            st.metric("Total Members", len(members_df))
-        else:
-            st.metric("Total Members", 0)
         
-        home_cells = get_home_cell_groups()
-        st.metric("Home Cell Groups", len(home_cells))
-        
-        if home_cells:
-            st.write("**Cell Groups:**")
-            for cell in home_cells:
-                cell_members = members_df[members_df['Home_Cell_Group'] == cell] if not members_df.empty else pd.DataFrame()
-                member_count = len(cell_members)
-                st.write(f"- {cell}: {member_count} members")
+        with st.spinner("Loading system data..."):
+            members_df = get_cached_members_master()
+            if not members_df.empty:
+                st.metric("Total Members", len(members_df))
+            else:
+                st.metric("Total Members", 0)
+            
+            home_cells = get_home_cell_groups()
+            st.metric("Home Cell Groups", len(home_cells))
+            
+            if home_cells:
+                st.write("**Cell Groups:**")
+                for cell in home_cells:
+                    cell_members = members_df[members_df['Home_Cell_Group'] == cell] if not members_df.empty else pd.DataFrame()
+                    member_count = len(cell_members)
+                    st.write(f"- {cell}: {member_count} members")
         
         st.divider()
         st.subheader("System Actions")
-        if st.button("🔄 Clear Cache & Refresh", use_container_width=True):
-            st.cache_data.clear()
-            st.cache_resource.clear()
-            st.success("✅ Cache cleared!")
-            time.sleep(1)
-            st.rerun()
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 Clear Cache & Refresh", use_container_width=True, help="Clear all cached data"):
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                st.success("✅ Cache cleared!")
+                time.sleep(1)
+                st.rerun()
+        
+        with col2:
+            if st.button("📊 Update Attendance Summary", use_container_width=True, help="Recalculate at-risk members"):
+                with st.spinner("Updating..."):
+                    if update_attendance_summary():
+                        st.success("✅ Summary updated!")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error("❌ Failed to update")
+    
+    with tab4:
+        st.subheader("🔧 Debug Information")
+        
+        st.write("### Connection Status")
+        client = get_google_sheets_client()
+        if client:
+            st.success("✅ Google Sheets: Connected")
+            
+            try:
+                spreadsheet = client.open_by_key(SPREADSHEET_ID)
+                worksheets = spreadsheet.worksheets()
+                st.success(f"✅ Spreadsheet: {len(worksheets)} worksheets found")
+                
+                st.write("### Worksheets Found:")
+                for ws in worksheets:
+                    st.write(f"- {ws.title}")
+            except Exception as e:
+                st.error(f"❌ Error accessing spreadsheet: {str(e)}")
+        else:
+            st.error("❌ Google Sheets: Not connected")
+        
+        st.divider()
+        st.write("### Streamlit Secrets")
+        if hasattr(st, 'secrets'):
+            st.success("✅ Streamlit secrets available")
+            secret_keys = list(st.secrets.keys())
+            st.write(f"Available secrets: {', '.join(secret_keys)}")
+            
+            if 'gcp_service_account' in st.secrets:
+                st.success("✅ gcp_service_account found in secrets")
+            else:
+                st.error("❌ gcp_service_account NOT in secrets")
+        else:
+            st.warning("⚠️ Streamlit secrets not available (running locally?)")
+            
+        st.divider()
+        st.write("### Credentials Check")
+        creds_path = os.path.join(os.path.dirname(__file__), 'credentials.json')
+        if os.path.exists(creds_path):
+            st.success(f"✅ Local credentials.json found at: {creds_path}")
+            try:
+                with open(creds_path, 'r') as f:
+                    creds = json.load(f)
+                    if 'client_email' in creds:
+                        st.info(f"Service Account: {creds['client_email']}")
+            except:
+                st.error("❌ Error reading credentials.json")
+        else:
+            st.info("ℹ️ No local credentials.json (using Streamlit secrets)")
 
 def main():
     st.set_page_config(
@@ -898,6 +1049,33 @@ def main():
         page_icon="🏛️",
         layout="wide"
     )
+    
+    # ====== DEBUG SECTION (Remove after fixing) ======
+    if not st.session_state.logged_in:
+        with st.sidebar:
+            st.write("🔍 **Debug Info**")
+            st.write(f"Has secrets: {hasattr(st, 'secrets')}")
+            if hasattr(st, 'secrets'):
+                st.write(f"Secret keys: {list(st.secrets.keys())}")
+                if 'gcp_service_account' in st.secrets:
+                    st.success("✅ gcp_service_account found")
+                else:
+                    st.error("❌ gcp_service_account NOT in secrets")
+            
+            # Test Google Sheets connection
+            st.write("Testing Google Sheets...")
+            client = get_google_sheets_client()
+            if client:
+                st.success("✅ Google Sheets connected!")
+                try:
+                    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+                    worksheets = spreadsheet.worksheets()
+                    st.write(f"📊 Worksheets: {len(worksheets)} found")
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)}")
+            else:
+                st.error("❌ Google Sheets connection failed")
+    # ====== END DEBUG SECTION ======
     
     if not st.session_state.logged_in:
         login_page()
