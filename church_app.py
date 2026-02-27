@@ -965,6 +965,15 @@ def main():
         layout="wide"
     )
 
+    # Hide Fork button, Streamlit footer and top menu
+    st.markdown("""
+        <style>
+            [data-testid="stToolbar"] {visibility: hidden !important;}
+            footer {visibility: hidden !important;}
+            header {visibility: hidden !important;}
+        </style>
+    """, unsafe_allow_html=True)
+
     if not st.session_state.logged_in:
         login_page()
     else:
